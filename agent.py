@@ -111,7 +111,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # "demo_resilient" (deterministic fallback may play; benchmark
     # invalidated and prominently logged).
     "failure_policy": "benchmark_strict",
-    "action_chunk_max_actions": 16,
+    # Ceiling (not target) for one ActionChunk: enough to cover a full
+    # turn without encouraging abnormally long plans.
+    "action_chunk_max_actions": 8,
     # Delta observations: OFF by default for beta correctness -- a compact
     # diff cannot carry a newly drawn card's full human-visible face (cost,
     # playable, displayed text, modifiers, hover/preview). Even when
@@ -155,7 +157,7 @@ def _looks_like_decision_object(obj: Any) -> bool:
     )
 
 
-PROMPT_SCHEMA_VERSION = 2
+PROMPT_SCHEMA_VERSION = 3
 
 
 def migrate_prompt_config(user_config: dict[str, Any]) -> tuple[dict, list[str]]:
@@ -166,11 +168,16 @@ def migrate_prompt_config(user_config: dict[str, Any]) -> tuple[dict, list[str]]
       policy "Assume no prior knowledge..." must not silently survive).
     - A genuinely CUSTOM template is preserved untouched; the caller gets
       a warning list for the UI/status.
+    - EXCEPTION (schema 3, user-approved): the old custom prompt that told
+      the model to "use external public knowledge" conflicts with the
+      benchmark epistemic policy -- it is migrated to the compact
+      benchmark prompt instead of being preserved.
     Returns (config, warnings).
     """
     from prompts import (
         DEFAULT_SYSTEM_TEMPLATE,
         DEFAULT_USER_TEMPLATE,
+        LEGACY_CUSTOM_PROMPT_MARKERS,
         LEGACY_DEFAULT_SYSTEM_TEMPLATES,
         LEGACY_DEFAULT_USER_TEMPLATES,
         PROMPT_SCHEMA_VERSION,
@@ -191,11 +198,22 @@ def migrate_prompt_config(user_config: dict[str, Any]) -> tuple[dict, list[str]]
             " authoritative, no runtime web)."
         )
     elif st is not None and st != DEFAULT_SYSTEM_TEMPLATE:
-        warnings.append(
-            "Custom system prompt from an older schema retained."
-            " Review/reset it manually if you want the new benchmark"
-            " policy."
-        )
+        if any(marker in st for marker in LEGACY_CUSTOM_PROMPT_MARKERS):
+            # User-approved one-time migration: the old custom prompt
+            # claimed runtime external knowledge was usable, which breaks
+            # the benchmark definition, and duplicated the rulebook.
+            cfg["system_template"] = DEFAULT_SYSTEM_TEMPLATE
+            warnings.append(
+                "Old custom system prompt (claimed runtime external"
+                " knowledge) migrated to the compact benchmark prompt"
+                " (user-approved schema-3 migration)."
+            )
+        else:
+            warnings.append(
+                "Custom system prompt from an older schema retained."
+                " Review/reset it manually if you want the new benchmark"
+                " policy."
+            )
 
     ut = cfg.get("user_template")
     if ut in LEGACY_DEFAULT_USER_TEMPLATES:
@@ -670,6 +688,15 @@ class AgentSession:
                 self._config["reasoning_effort"] = "high"
             if self._config.get("provider_profile") not in ("auto", "generic", "deepseek"):
                 self._config["provider_profile"] = "auto"
+            # P0: normalize the chunk ceiling ONCE here -- null / invalid /
+            # <=0 fall back to the default so downstream code never has to
+            # handle a nullable value.
+            raw_max = self._config.get("action_chunk_max_actions")
+            try:
+                max_actions = int(raw_max)
+            except (TypeError, ValueError):
+                max_actions = 8
+            self._config["action_chunk_max_actions"] = max(1, max_actions)
             self._stop.clear()
             self._running = True
             self._llm_inflight = 0
@@ -713,6 +740,7 @@ class AgentSession:
         # lock -- safe now; a tiny race with the worker's own logs is fine).
         for w in prompt_warnings:
             self._log("warning", w)
+        self._log_config_audit()
 
     def stop(self) -> None:
         self._stop.set()
@@ -1570,6 +1598,68 @@ class AgentSession:
                 if len(self._live_content) > 4000:
                     self._live_content = self._live_content[-2000:]
 
+    def _action_chunk_limit(self) -> int:
+        """Defensive chunk-ceiling read (P0): even though start() normalizes
+        the config once, the parser call site must never assume it."""
+        try:
+            return max(1, int(
+                self._config.get("action_chunk_max_actions", 8)))
+        except (TypeError, ValueError):
+            return 8
+
+    def _log_config_audit(self) -> None:
+        """P8/P9: developer-only one-line config summary + suspicious-config
+        warnings. NEVER logs api_key."""
+        cfg = self._config
+        self._log(
+            "info",
+            "CONFIG AUDIT:"
+            f" decision_mode={cfg.get('decision_mode')}"
+            f" chunk_max={self._action_chunk_limit()}"
+            f" thinking={cfg.get('thinking_enabled')}"
+            f" reasoning={cfg.get('reasoning_policy')}"
+            f" entry={cfg.get('reasoning_effort_combat_entry')}"
+            f" followup={cfg.get('reasoning_effort_combat_followup')}"
+            f" noncombat={cfg.get('reasoning_effort_noncombat')}"
+            f" retry={cfg.get('reasoning_effort_retry')}"
+            f" history={cfg.get('max_history_turns')}"
+            f" context_chars={cfg.get('max_context_chars')}"
+            f" delta={cfg.get('delta_observations')}"
+            f" failure_policy={cfg.get('failure_policy')}"
+            f" headful={cfg.get('headful_native_ui')}"
+            f" fast={cfg.get('fast_mode')}"
+            f" llm_retries={cfg.get('llm_retries')}",
+        )
+        # Suspicious-config warnings (informational, never auto-overridden).
+        if (cfg.get("decision_mode") == "action_chunk"
+                and self._action_chunk_limit() <= 1):
+            self._log(
+                "warning",
+                "action_chunk mode with chunk_max<=1: every plan can only"
+                " carry ONE action -- multi-action cognition is impossible.",
+            )
+        if cfg.get("reasoning_policy") == "adaptive":
+            efforts = {
+                cfg.get("reasoning_effort_fixed"),
+                cfg.get("reasoning_effort_combat_entry"),
+                cfg.get("reasoning_effort_combat_followup"),
+                cfg.get("reasoning_effort_noncombat"),
+                cfg.get("reasoning_effort_retry"),
+            }
+            if len(efforts) == 1:
+                self._log(
+                    "warning",
+                    "adaptive reasoning policy currently degenerates to ONE"
+                    f" effective effort ({next(iter(efforts))}) -- the"
+                    " entry/followup split has no effect.",
+                )
+        if cfg.get("thinking_enabled") is False:
+            self._log(
+                "warning",
+                "Thinking is disabled; cognition-quality comparison may not"
+                " match the intended adaptive benchmark.",
+            )
+
     def _checkpoint_requires_full_state(
         self,
         previous_model_state: dict[str, Any] | None,
@@ -1926,9 +2016,7 @@ class AgentSession:
             try:
                 chunk = parse_action_chunk(
                     parsed, state,
-                    max_actions=max(
-                        1, int(self._config.get("action_chunk_max_actions", 16))
-                    ),
+                    max_actions=self._action_chunk_limit(),
                 )
             except PlanParseError as e:
                 attempt_feedback = str(e)
@@ -2492,7 +2580,7 @@ class AgentSession:
             )
 
         if act is not None:
-            self._metrics.record_plan(1)
+            self._metrics.record_plan(1, chunk=False)
         result_note = self._send_single_action(act, state)
         self._decision_count += 1
         self._log(

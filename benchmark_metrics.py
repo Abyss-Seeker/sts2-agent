@@ -235,9 +235,31 @@ class BenchmarkMetrics:
             usage=usage,
         )
 
-    def record_plan(self, action_count: int) -> None:
+    # ---- Chunk-length distribution (P9): planned vs executed ----------
+    # planned 4 / executed 2 (HAND_CHANGED mid-plan) is NORMAL; only the
+    # planned distribution shows multi-action cognition.
+    action_chunk_plan_count: int = 0
+    action_chunk_planned_actions_total: int = 0
+    chunk_len_1: int = 0
+    chunk_len_2: int = 0
+    chunk_len_3: int = 0
+    chunk_len_4_plus: int = 0
+
+    def record_plan(self, action_count: int, *, chunk: bool = True) -> None:
         self.strategic_plan_count += 1
-        self.planned_actions_total += max(0, int(action_count))
+        n = max(0, int(action_count))
+        self.planned_actions_total += n
+        if chunk:
+            self.action_chunk_plan_count += 1
+            self.action_chunk_planned_actions_total += n
+            if n <= 1:
+                self.chunk_len_1 += 1
+            elif n == 2:
+                self.chunk_len_2 += 1
+            elif n == 3:
+                self.chunk_len_3 += 1
+            else:
+                self.chunk_len_4_plus += 1
 
     def record_action_sent(self, *, from_plan: bool = True, combat: bool = False) -> None:
         """Handed to the bridge -- NOT yet confirmed. Does NOT touch
@@ -531,7 +553,35 @@ class BenchmarkMetrics:
                 if (run_hit + run_miss) else None),
             "checkpoint_reasons": run_checkpoints,
             "reasoning_by_effort": reasoning_by_effort,
+            # Chunk-length distribution (planned, not executed -- a plan
+            # interrupted by HAND_CHANGED after step 2 of 4 is normal).
+            # Delta-based: run-local slice (A8 additive counters).
+            "action_chunk_plan_count": delta.get(
+                "action_chunk_plan_count", 0),
+            "action_chunk_planned_actions_total": delta.get(
+                "action_chunk_planned_actions_total", 0),
+            "chunk_len_1": delta.get("chunk_len_1", 0),
+            "chunk_len_2": delta.get("chunk_len_2", 0),
+            "chunk_len_3": delta.get("chunk_len_3", 0),
+            "chunk_len_4_plus": delta.get("chunk_len_4_plus", 0),
+            "planned_actions_total": delta.get(
+                "planned_actions_total", 0),
+            "executed_planned_actions_total": delta.get(
+                "executed_planned_actions_total", 0),
+            "mean_planned_actions_per_chunk": (
+                delta.get("action_chunk_planned_actions_total", 0)
+                / delta.get("action_chunk_plan_count", 0)
+                if delta.get("action_chunk_plan_count") else 0.0),
+            "median_planned_actions_per_chunk": None,
         }
+
+    def _median_chunk_len(self) -> float | None:
+        lens: list[int] = (
+            [1] * self.chunk_len_1 + [2] * self.chunk_len_2
+            + [3] * self.chunk_len_3 + [4] * self.chunk_len_4_plus)
+        if not lens:
+            return None
+        return statistics.median(lens)
 
     def snapshot(self) -> dict[str, Any]:
         fresh = self.prompt_cache_miss_tokens
@@ -651,4 +701,20 @@ class BenchmarkMetrics:
                 for effort, calls in sorted(
                     self.llm_calls_by_reasoning_effort.items())
             },
+            # Chunk-length distribution (planned, not executed).
+            "action_chunk_plan_count": self.action_chunk_plan_count,
+            "action_chunk_planned_actions_total": (
+                self.action_chunk_planned_actions_total),
+            "chunk_len_1": self.chunk_len_1,
+            "chunk_len_2": self.chunk_len_2,
+            "chunk_len_3": self.chunk_len_3,
+            "chunk_len_4_plus": self.chunk_len_4_plus,
+            "planned_actions_total": self.planned_actions_total,
+            "executed_planned_actions_total": (
+                self.executed_planned_actions_total),
+            "mean_planned_actions_per_chunk": (
+                self.action_chunk_planned_actions_total
+                / self.action_chunk_plan_count
+                if self.action_chunk_plan_count else 0.0),
+            "median_planned_actions_per_chunk": self._median_chunk_len(),
         }
