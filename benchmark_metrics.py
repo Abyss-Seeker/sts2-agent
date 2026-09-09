@@ -31,6 +31,35 @@ def extract_reasoning_tokens(usage: Any) -> int:
 
 
 @dataclass
+class MetricCheckpoint:
+    """Raw metric evidence captured at a run boundary (A7): additive
+    counter values, list LENGTHS (suffixes are taken later), and copies
+    of Counter maps. Derived metrics (ratios, percentiles, means) are
+    deliberately NOT stored -- they are recomputed from run-local
+    evidence by ``snapshot_since``."""
+
+    counters: dict[str, float] = field(default_factory=dict)
+    list_lens: dict[str, int] = field(default_factory=dict)
+    counter_maps: dict[str, dict[str, int]] = field(default_factory=dict)
+    effort_list_lens: dict[str, int] = field(default_factory=dict)
+
+
+# Lists whose per-run slice is the SUFFIX after the baseline length (A9).
+_LIST_METRICS = (
+    "llm_latencies_ms",
+    "first_reasoning_token_ms",
+    "first_content_token_ms",
+    "combat_llm_latencies_ms",
+)
+# Counter maps whose per-run slice is the DIFFERENCE (A10).
+_COUNTER_MAP_METRICS = (
+    "checkpoint_reasons",
+    "llm_calls_by_reasoning_effort",
+    "reasoning_tokens_by_effort",
+)
+
+
+@dataclass
 class BenchmarkMetrics:
     benchmark_valid: bool = True
     invalidation_reason: str = ""
@@ -108,11 +137,15 @@ class BenchmarkMetrics:
     planned_actions_total: int = 0
     executed_planned_actions_total: int = 0
     checkpoint_reasons: Counter = field(default_factory=Counter)
+    # How many times invalidate() fired (per-run validity derivation, A12:
+    # a run is invalid iff an invalidation happened DURING it).
+    invalidation_count: int = 0
 
     def invalidate(self, reason: str) -> None:
         if self.benchmark_valid:
             self.invalidation_reason = reason
         self.benchmark_valid = False
+        self.invalidation_count += 1
 
     def record_inspection(self, *, combat: bool = False) -> None:
         """One cognitive boundary / model inspect request."""
@@ -313,25 +346,192 @@ class BenchmarkMetrics:
         frac = rank - low
         return ordered[low] * (1 - frac) + ordered[high] * frac
 
-    def slice_since(self, baseline: dict[str, Any]) -> dict[str, Any]:
-        """Per-run metric slice: numeric fields diffed against a baseline
-        snapshot, non-numeric state taken as-is. Latency/token LIST fields
-        cannot be diffed and are omitted from the slice (session totals
-        remain in snapshot()); the runner reports those at session level.
-        """
-        current = self.snapshot()
-        out: dict[str, Any] = {}
-        for key, val in current.items():
-            base = baseline.get(key)
-            if isinstance(val, (int, float)) and not isinstance(val, bool) \
-                    and isinstance(base, (int, float)) \
-                    and not isinstance(base, bool):
-                out[key] = max(0, val - base)
-            elif isinstance(val, (list, tuple, dict)):
-                continue  # non-diffable; session-level only
-            else:
-                out[key] = val
-        return out
+    def checkpoint(self) -> MetricCheckpoint:
+        """Capture RAW run-boundary evidence (A7). Never captures derived
+        values -- snapshot_since() recomputes those from the run-local
+        evidence, so per-run ratios/percentiles are mathematically
+        correct instead of differences of session aggregates (A6)."""
+        from dataclasses import fields as dc_fields
+
+        counters: dict[str, float] = {}
+        for f in dc_fields(self):
+            val = getattr(self, f.name)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                counters[f.name] = val
+        return MetricCheckpoint(
+            counters=counters,
+            list_lens={
+                name: len(getattr(self, name)) for name in _LIST_METRICS
+            },
+            counter_maps={
+                name: dict(getattr(self, name))
+                for name in _COUNTER_MAP_METRICS
+            },
+            effort_list_lens={
+                effort: len(lat_list)
+                for effort, lat_list in self.latency_ms_by_effort.items()
+            },
+        )
+
+    def snapshot_since(self, baseline: MetricCheckpoint) -> dict[str, Any]:
+        """Per-run slice with the SAME schema as snapshot() (A13): additive
+        counters are deltas (A8), list metrics are recomputed from the
+        run-local SUFFIX (A9), counter maps are diffed (A10),
+        reasoning-by-effort is recomputed per run (A11), and all derived
+        ratios/percentiles come from run-local evidence only (A6/A7).
+        ``benchmark_valid`` reflects invalidations that happened DURING
+        this run (A12)."""
+        cur = self.checkpoint()
+        delta = {
+            key: max(0, cur.counters.get(key, 0) - base)
+            for key, base in baseline.counters.items()
+        }
+
+        def suffix(name: str) -> list:
+            start = baseline.list_lens.get(name, 0)
+            return list(getattr(self, name))[start:]
+
+        lat = suffix("llm_latencies_ms")
+        first_reasoning = suffix("first_reasoning_token_ms")
+        first_content = suffix("first_content_token_ms")
+        combat_lat = suffix("combat_llm_latencies_ms")
+
+        def map_delta(name: str) -> Counter:
+            return Counter(getattr(self, name)) - Counter(
+                baseline.counter_maps.get(name, {}))
+
+        run_checkpoints = dict(map_delta("checkpoint_reasons"))
+        calls_by_effort = map_delta("llm_calls_by_reasoning_effort")
+        tokens_by_effort = map_delta("reasoning_tokens_by_effort")
+
+        # A11: per-effort stats recomputed from each effort's latency
+        # SUFFIX (new efforts start at length 0).
+        reasoning_by_effort: dict[str, Any] = {}
+        for effort in sorted(calls_by_effort):
+            calls = int(calls_by_effort.get(effort, 0))
+            if calls <= 0:
+                # No NEW successful calls with this effort in this run --
+                # zero evidence means the effort must not appear at all
+                # (no leakage from earlier runs).
+                continue
+            lat_suf = list(self.latency_ms_by_effort.get(effort, []))[
+                baseline.effort_list_lens.get(effort, 0):]
+            r_tokens = int(tokens_by_effort.get(effort, 0))
+            reasoning_by_effort[effort] = {
+                "calls": calls,
+                "reasoning_tokens": r_tokens,
+                "mean_reasoning_tokens": (r_tokens / calls if calls else 0.0),
+                "latency_ms_p50": self._percentile(lat_suf, 0.50),
+                "latency_ms_p95": self._percentile(lat_suf, 0.95),
+            }
+
+        confirmed = delta.get("game_action_confirmed_count", 0)
+        combat_confirmed = delta.get("combat_game_action_confirmed_count", 0)
+        run_plans_done = delta.get("plan_completed_count", 0)
+        run_plans_interrupted = delta.get("plan_interrupted_count", 0)
+        run_plans_total = run_plans_done + run_plans_interrupted
+        run_hit = delta.get("prompt_cache_hit_tokens", 0)
+        run_miss = delta.get("prompt_cache_miss_tokens", 0)
+        # A12: validity comes from THIS run's own invalidation events.
+        invalidated = delta.get("invalidation_count", 0) > 0
+
+        return {
+            "benchmark_valid": not invalidated,
+            "invalidation_reason": (
+                self.invalidation_reason if invalidated else ""),
+            "model_call_count": delta.get("llm_request_count", 0),
+            "strategic_plan_count": delta.get("strategic_plan_count", 0),
+            "game_action_count": confirmed,
+            "game_action_sent_count": delta.get("game_action_sent_count", 0),
+            "game_action_confirmed_count": confirmed,
+            "game_action_rejected_count": delta.get(
+                "game_action_rejected_count", 0),
+            "game_action_unconfirmable_count": delta.get(
+                "game_action_unconfirmable_count", 0),
+            "model_inspection_count": delta.get(
+                "model_inspection_count", 0),
+            "logical_inspection_count": delta.get(
+                "logical_inspection_count", 0),
+            "llm_request_count": delta.get("llm_request_count", 0),
+            "llm_success_count": delta.get("llm_success_count", 0),
+            "llm_failed_request_count": delta.get(
+                "llm_failed_request_count", 0),
+            "checkpoint_count": delta.get("checkpoint_count", 0),
+            "plan_completed_count": run_plans_done,
+            "plan_interrupted_count": run_plans_interrupted,
+            "invalid_plan_count": delta.get("invalid_plan_count", 0),
+            "invalid_action_count": delta.get("invalid_action_count", 0),
+            "fallback_action_count": delta.get("fallback_action_count", 0),
+            "http_attempt_count": delta.get("llm_request_count", 0),
+            "combat_llm_request_count": delta.get(
+                "combat_llm_request_count", 0),
+            "combat_llm_success_count": delta.get(
+                "combat_llm_success_count", 0),
+            "combat_logical_inspection_count": delta.get(
+                "combat_logical_inspection_count", 0),
+            "combat_game_action_sent_count": delta.get(
+                "combat_game_action_sent_count", 0),
+            "combat_game_action_confirmed_count": combat_confirmed,
+            "combat_actions_per_llm_call": (
+                combat_confirmed / delta.get("combat_llm_request_count", 0)
+                if delta.get("combat_llm_request_count") else 0.0
+            ),
+            "combat_actions_per_logical_inspection": (
+                combat_confirmed
+                / delta.get("combat_logical_inspection_count", 0)
+                if delta.get("combat_logical_inspection_count") else 0.0
+            ),
+            "combat_llm_latency_ms_p50": self._percentile(combat_lat, 0.50),
+            "combat_llm_latency_ms_p95": self._percentile(combat_lat, 0.95),
+            "combat_prompt_tokens": delta.get("combat_prompt_tokens", 0),
+            "combat_completion_tokens": delta.get(
+                "combat_completion_tokens", 0),
+            "combat_reasoning_tokens": delta.get("combat_reasoning_tokens", 0),
+            "combat_turn_count": delta.get("combat_turn_count", 0),
+            "recoverable_termination_count": delta.get(
+                "recoverable_termination_count", 0),
+            "bridge_reconnect_count": delta.get("bridge_reconnect_count", 0),
+            "game_relaunch_count": delta.get("game_relaunch_count", 0),
+            "safe_recovery_count": delta.get("safe_recovery_count", 0),
+            "strategic_recovery_count": delta.get(
+                "strategic_recovery_count", 0),
+            "transport_interrupted_action_count": delta.get(
+                "transport_interrupted_action_count", 0),
+            "actions_per_llm_call": (
+                confirmed / delta.get("llm_request_count", 0)
+                if delta.get("llm_request_count") else 0.0
+            ),
+            "actions_per_logical_inspection": (
+                confirmed / delta.get("logical_inspection_count", 0)
+                if delta.get("logical_inspection_count") else 0.0
+            ),
+            "plan_completion_ratio": (
+                run_plans_done / run_plans_total if run_plans_total else 0.0
+            ),
+            "executed_vs_planned_ratio": (
+                delta.get("executed_planned_actions_total", 0)
+                / delta.get("planned_actions_total", 0)
+                if delta.get("planned_actions_total") else 0.0
+            ),
+            "llm_latency_ms_p50": self._percentile(lat, 0.50),
+            "llm_latency_ms_p95": self._percentile(lat, 0.95),
+            "llm_latency_ms_mean": (
+                statistics.mean(lat) if lat else None),
+            "first_reasoning_token_ms_p50": self._percentile(
+                first_reasoning, 0.50),
+            "first_content_token_ms_p50": self._percentile(
+                first_content, 0.50),
+            "prompt_tokens": delta.get("prompt_tokens", 0),
+            "completion_tokens": delta.get("completion_tokens", 0),
+            "reasoning_tokens": delta.get("reasoning_tokens", 0),
+            "prompt_cache_hit_tokens": run_hit,
+            "prompt_cache_miss_tokens": run_miss,
+            "cache_hit_ratio": (
+                run_hit / (run_hit + run_miss)
+                if (run_hit + run_miss) else None),
+            "checkpoint_reasons": run_checkpoints,
+            "reasoning_by_effort": reasoning_by_effort,
+        }
 
     def snapshot(self) -> dict[str, Any]:
         fresh = self.prompt_cache_miss_tokens

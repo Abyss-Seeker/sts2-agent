@@ -94,6 +94,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (used to pinpoint where a relay/proxy corrupts replies). Safe to turn
     # off once the relay is fixed.
     "dump_raw_responses": True,
+    # Normal-terminal behavior: True (default) auto-starts the NEXT run
+    # after victory/defeat (web UI / legacy continuous runner). The formal
+    # runner sets False: one task = exactly ONE genuine run -- after the
+    # run_report the agent STOPS at the safe terminal boundary and the
+    # RUNNER applies the next task's frozen config (A2/A4). Recoverable
+    # terminations (same-save resume) are unaffected by this flag (A3).
+    "continue_after_normal_terminal": True,
     # ---- Beta: LLM-native ActionChunk mode -------------------------
     # decision_mode: "single_action" (baseline, one action per call) or
     # "action_chunk" (one model plan may drive several individually
@@ -685,7 +692,7 @@ class AgentSession:
             self._last_model_failure_reason = ""
             self._pending_single_action = None
             self._pending_single_before_state = None
-            self._run_baseline_snapshot = self._metrics.snapshot()
+            self._run_baseline_snapshot = self._metrics.checkpoint()
             self._combat_identity = None
             self._reasoning_context_class = ""
             self._requested_reasoning_effort = ""
@@ -1129,20 +1136,40 @@ class AgentSession:
                         )
                     # Per-run report slice for the continuous runner
                     # (developer/benchmark artifact, never an LLM prompt).
-                    # snapshot = THIS run's metric delta only (the session
-                    # cumulative totals live in the final report).
+                    # snapshot = THIS run's metrics only, with derived
+                    # values recomputed from run-local evidence (the
+                    # session cumulative totals live in the final report).
                     self._log(
                         "run_report",
                         f"{kind} at floor {state.get('floor', '?')}",
                         run_id=self._run_id,
                         result=kind,
-                        snapshot=self._metrics.slice_since(
+                        snapshot=self._metrics.snapshot_since(
                             self._run_baseline_snapshot
                         ),
                     )
                     if kind in ("NORMAL_VICTORY", "NORMAL_DEFEAT"):
+                        if not self._config.get(
+                            "continue_after_normal_terminal", True
+                        ):
+                            # Formal task mode (A2/A4): ONE task = ONE
+                            # genuine run. The run_report above already
+                            # finalized the per-run metrics; the RUNNER now
+                            # owns the task boundary and applies the next
+                            # task's frozen config. Never silently start
+                            # another run under the old config.
+                            self._agent_phase = "terminal"
+                            self._log(
+                                "info",
+                                "正式任务模式：run 已结束，Agent 停在安全终局边界，"
+                                "下一任务由 runner 控制。",
+                            )
+                            break
                         resume_ok = self._maybe_resume(same_run=False)
                     else:
+                        # A3: recoverable termination is SAME-RUN recovery
+                        # -- same run_id/seed/mode/memory slice; never
+                        # advances the runner's task.
                         resume_ok = self._recover_interrupted_run(state)
                     if not resume_ok:
                         break
@@ -1270,7 +1297,7 @@ class AgentSession:
         self._run_id = uuid.uuid4().hex[:12]
         # Per-run metric slice baseline (§22): the runner's run_report
         # snapshot must be a per-run DELTA, not the cumulative counter.
-        self._run_baseline_snapshot = self._metrics.snapshot()
+        self._run_baseline_snapshot = self._metrics.checkpoint()
         self._log("info", f"新 run 开始 (run_id={self._run_id})。")
 
     def _maybe_resume(self, *, same_run: bool = True) -> bool:

@@ -105,10 +105,11 @@ class TestSeedManifest(unittest.TestCase):
             decision_mode="paired", seed_file=str(seed_file), seed=None,
             max_runs=1,
         ))
+        # A19 counterbalance: even seed single-first, odd seed chunk-first.
         self.assertEqual(
             [(t["seed"], t["decision_mode"]) for t in args],
             [("SEED_A", "single_action"), ("SEED_A", "action_chunk"),
-             ("SEED_B", "single_action"), ("SEED_B", "action_chunk")],
+             ("SEED_B", "action_chunk"), ("SEED_B", "single_action")],
         )
         seed_file.unlink()
 
@@ -158,7 +159,7 @@ class TestPerRunMetrics(unittest.TestCase):
         m.record_llm_success()
         m.record_action_sent(from_plan=False)
         m.record_action_confirmed()
-        base = m.snapshot()
+        base = m.checkpoint()
         # ---- run 2 happens ----
         m.record_llm_request()
         m.record_llm_success()
@@ -167,7 +168,7 @@ class TestPerRunMetrics(unittest.TestCase):
         m.record_action_sent(from_plan=False)
         m.record_action_confirmed()
         m.record_action_rejected()
-        slice2 = m.slice_since(base)
+        slice2 = m.snapshot_since(base)
         # run 2 issued: request+success, request+failure => 2 requests
         self.assertEqual(slice2["llm_request_count"], 2)
         self.assertEqual(slice2["llm_success_count"], 1)
