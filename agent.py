@@ -1999,6 +1999,12 @@ class AgentSession:
             text = format_state(state, None)
         except Exception:
             return None
+        if "formatting error:" in text:
+            # format_state caught a formatter exception and fell back to a
+            # text that embeds the RAW payload (request_id / possibly
+            # non-human-visible fields). Such a state must NEVER take part
+            # in a confirmation comparison -> UNKNOWN_CONFIRMATION.
+            return None
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     def _reconcile_pending_single_action(self, state: dict[str, Any]) -> None:

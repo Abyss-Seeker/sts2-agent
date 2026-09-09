@@ -325,6 +325,25 @@ def test_model_call_count_alias_consistent() -> None:
     print("PASS item6 model_call_count_alias_consistent")
 
 
+def test_formatter_error_fingerprint_is_none() -> None:
+    """format_state catches formatter exceptions and returns a text that
+    embeds the RAW payload (request_id / non-visible fields). Such a
+    state must yield fingerprint None -> UNKNOWN_CONFIRMATION."""
+    import agent as agent_mod
+
+    original = agent_mod.format_state
+    agent_mod.format_state = lambda *a, **k: (
+        '== COMBAT (formatting error: boom) ==\nraw: {"request_id": "r1"}'
+    )
+    try:
+        s = agent_mod.AgentSession()
+        assert s._visible_state_fingerprint(
+            {"type": "combat_action"}) is None
+    finally:
+        agent_mod.format_state = original
+    print("PASS microfix formatter_error_fingerprint_is_none")
+
+
 def run_all() -> None:
     tests = [
         test_generic_relay_with_deepseek_model_name_gets_no_native_fields,
@@ -336,6 +355,7 @@ def run_all() -> None:
         test_internal_http_retry_counted,
         test_stale_last_usage_not_reused,
         test_model_call_count_alias_consistent,
+        test_formatter_error_fingerprint_is_none,
     ]
     for fn in tests:
         fn()
