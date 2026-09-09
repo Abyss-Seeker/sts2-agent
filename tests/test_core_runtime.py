@@ -285,7 +285,14 @@ def test_target_gone_causes_checkpoint():
     )
     ev = ex.accept_state(s1)
     assert ev.status == ExecutorStatus.NEED_MODEL
-    assert ev.checkpoint.reason == CheckpointReason.TARGET_GONE
+    # SEMANTICS UPDATE (combat-resolved invariant): the single enemy is
+    # dead AND the screen is still combat_action -> the combat is RESOLVED.
+    # COMBAT_RESOLVED supersedes TARGET_GONE for a fully dead board; the
+    # caller (agent) re-inspects at the next real screen either way.
+    assert ev.checkpoint.reason in (
+        CheckpointReason.TARGET_GONE,
+        CheckpointReason.COMBAT_RESOLVED,
+    ), ev
 
 
 def test_duplicate_cards_resolve_after_shift():

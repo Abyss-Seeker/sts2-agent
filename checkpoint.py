@@ -27,6 +27,7 @@ class CheckpointReason(str, Enum):
     TARGET_GONE = "TARGET_GONE"
     POTION_INVALID = "POTION_INVALID"
     NEXT_ACTION_ILLEGAL = "NEXT_ACTION_ILLEGAL"
+    COMBAT_RESOLVED = "COMBAT_RESOLVED"
     TERMINAL = "TERMINAL"
     UNKNOWN_STATE_CHANGE = "UNKNOWN_STATE_CHANGE"
 
@@ -125,6 +126,25 @@ def evaluate_after_action(
             ),
             delta,
         )
+
+    # COMBAT RESOLVED lifecycle invariant: if the bridge still shows a
+    # combat_action screen but NO enemy is alive, the combat is over. The
+    # remaining chunk (potion, extra attacks, end_turn) must NEVER execute
+    # against a dead board -- re-inspect at the next real screen instead.
+    if stype == "combat_action":
+        enemies = [
+            e for e in (after.get("enemies") or [])
+            if isinstance(e, dict)
+        ]
+        if enemies and not any(e.get("is_alive", False) for e in enemies):
+            return (
+                CheckpointDecision(
+                    True,
+                    CheckpointReason.COMBAT_RESOLVED,
+                    "all enemies are dead; combat resolved",
+                ),
+                delta,
+            )
 
     if executed_action.checkpoint_after:
         return (
