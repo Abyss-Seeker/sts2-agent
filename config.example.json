@@ -17,6 +17,8 @@
   "disable_fallback": true,
   "save_log": true,
   "auto_launch_game": true,
+  "headful_native_ui": true,
+  "fast_mode": true,
   "steam_appid": "2868840",
   "action_delay": 0,
   "show_thinking": "brief",

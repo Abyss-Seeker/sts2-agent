@@ -20,7 +20,7 @@ const SELECT_FIELDS = [
   "reasoning_effort_combat_followup", "reasoning_effort_noncombat",
   "reasoning_effort_retry",
 ];
-const CHECK_FIELDS = ["disable_fallback", "save_log", "auto_launch_game", "delta_observations"];
+const CHECK_FIELDS = ["disable_fallback", "save_log", "auto_launch_game", "delta_observations", "headful_native_ui", "fast_mode"];
 
 const DEFAULT_PROMPTS = null; // filled from server DEFAULT_CONFIG on load
 let defaults = null;

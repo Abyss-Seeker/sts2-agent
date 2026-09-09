@@ -275,6 +275,20 @@ class STS2GameClient:
             "seconds": int(seconds),
         })
 
+    def set_headful(self, enabled: bool) -> None:
+        """Headful: game stays interactive (BGM/SFX/waits on)."""
+        self.send_action({
+            "action": "set_headful",
+            "enabled": bool(enabled),
+        })
+
+    def set_fast_mode(self, enabled: bool) -> None:
+        """FastMode accelerates native animations (independent of headful)."""
+        self.send_action({
+            "action": "set_fast_mode",
+            "enabled": bool(enabled),
+        })
+
     def ping(self) -> bool:
         try:
             self.send_action({"type": "PING"})
