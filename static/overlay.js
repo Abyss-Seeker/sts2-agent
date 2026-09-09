@@ -73,13 +73,20 @@
       box.innerHTML = '<div class="entry empty">暂无异常</div>';
       return;
     }
+    var KIND_LABEL = {
+      decision: "决策",
+      model_plan: "计划",
+      info: "信息",
+      error: "错误",
+      warning: "警告",
+    };
     for (var i = 0; i < shown.length; i++) {
       var e = shown[i];
       var div = document.createElement("div");
       div.className = "entry" + (e.kind === "error" ? " err"
         : e.kind === "warning" ? " warn" : "");
       var html = '<div class="e-meta">' + escapeHtml(e.ts || "") +
-        " · " + escapeHtml(e.kind || "") + "</div>";
+        " · " + escapeHtml(KIND_LABEL[e.kind] || e.kind || "") + "</div>";
       html += '<div class="e-thought">' + escapeHtml(e.text || "") + "</div>";
       div.innerHTML = html;
       box.appendChild(div);
@@ -95,7 +102,11 @@
         var addedNet = false;
         (d.logs || []).forEach(function (e) {
           if (e.seq && e.seq > lastSeq) lastSeq = e.seq;
-          if (e.kind === "decision") { recent.push(e); added = true; }
+          // 战斗中的模型认知是 model_plan（ActionChunk 计划的 thought），
+          // 与非战斗 decision 一样属于"决策"流；否则战斗内容只剩动作行。
+          if (e.kind === "decision" || e.kind === "model_plan") {
+            recent.push(e); added = true;
+          }
           else if (e.kind === "error" || e.kind === "warning" || e.kind === "info") {
             // 排除 kind === "state"（每回合都产生，太吵）
             netRecent.push(e); addedNet = true;
