@@ -887,8 +887,6 @@ class AgentSession:
         state_text = format_state(state, self._memory)
 
         if stype in TERMINAL_SCREEN_TYPES:
-
-        if stype in TERMINAL_SCREEN_TYPES:
             self._log("info", state_text)
             return
 
