@@ -899,6 +899,16 @@ class AgentSession:
                 if stype in TERMINAL_SCREEN_TYPES:
                     self._plan_executor.reset()
                     self._agent_phase = "terminal"
+                    # Diagnostics: record WHICH terminal state arrived and
+                    # its result (victory vs terminated) -- a terminal right
+                    # after a confirmed non-combat action points at the
+                    # mod's run-finalization path, not the agent.
+                    self._log(
+                        "state",
+                        f"收到终止状态: {stype}"
+                        f" (result={state.get('result', '?')},"
+                        f" floor={state.get('floor', '?')})",
+                    )
                     self._log("info", "Run finished; agent stopping.")
                     # AUTO-RESUME: the run's save is kept, so wait for the
                     # game to come back instead of tearing the session down.
