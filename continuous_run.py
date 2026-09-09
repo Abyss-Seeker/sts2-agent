@@ -270,7 +270,14 @@ def execute_suite(
     session: AgentSession | None = None
     suite_t0 = clock()
     last_heartbeat = 0.0
-    last_seq = 0
+    # A.1-1/2/3: the log cursor belongs to ONE AgentSession, never to the
+    # suite. A fresh AgentSession restarts its seq counter at 1 (verified:
+    # ``_log_seq = 0`` lives in AgentSession.__init__, start() does not
+    # reset it), so a suite-level cursor would swallow every subsequent
+    # task's logs (run_report / benchmark_invalidated / plan logs).
+    # Reset it whenever a NEW session is created; recovery (same session)
+    # keeps it advancing.
+    session_log_cursor = 0
     consecutive_invalid_tasks = 0
     task_idx = 0
     suite_timed_out = False
@@ -308,17 +315,21 @@ def execute_suite(
                      f" pair_index={task.get('pair_index')}"
                      f" pair_order={task.get('pair_order')}")
                 session = session_factory()
+                session_log_cursor = 0  # new session -> new seq namespace
                 session.start(task_cfg)
                 task_t0 = clock()
+                run_baseline = session._metrics.checkpoint()
 
             task = tasks[0] if not opts.formal else task
             if not opts.formal:
                 # Legacy: ONE session that auto-continues runs itself;
                 # --max-runs bounds the collected run count.
                 session = session_factory()
+                session_log_cursor = 0  # new session -> new seq namespace
                 session.start({**base_cfg,
                                "decision_mode": task["decision_mode"]})
                 task_t0 = clock()
+                run_baseline = session._metrics.checkpoint()
             outcome: str | None = None  # formal task outcome
             while outcome is None and state.stop_reason is None:
                 sleep(poll_interval)
@@ -327,8 +338,8 @@ def execute_suite(
 
                 # Drain logs: forward to stdout, collect run reports and
                 # invalidation events (dedup by run id).
-                for e in session.logs_since(last_seq):
-                    last_seq = max(last_seq, e["seq"])
+                for e in session.logs_since(session_log_cursor):
+                    session_log_cursor = max(session_log_cursor, e["seq"])
                     line = f"[{e['ts']}] {e['kind']}: {e['text']}"
                     extras = " | ".join(
                         f"{k}={e[k]}" for k in LOG_EXTRA_KEYS
@@ -391,6 +402,13 @@ def execute_suite(
                         # run never terminated, so synthesize its record.
                         emit(f"TASK TIMEOUT after {opts.task_max_seconds}s"
                              " -- marking censored.")
+                        # A.1-12: keep the evidence gathered before the
+                        # timeout (how far the censored run actually got).
+                        try:
+                            partial = session._metrics.snapshot_since(
+                                run_baseline)
+                        except Exception:
+                            partial = {}
                         session.stop()
                         state.runs.append({
                             "run_id": rid or "?",
@@ -402,7 +420,7 @@ def execute_suite(
                             "ended_at": None,
                             "benchmark_valid": False,
                             "censored": True,
-                            "metrics": {},
+                            "metrics": partial,
                         })
                         outcome = "timeout"
                 else:
@@ -474,15 +492,74 @@ def execute_suite(
     return state, session
 
 
+# Additive fields that may legitimately be SUMMED across runs (A.1-10).
+SUITE_ADDITIVE_FIELDS = (
+    "llm_request_count", "llm_success_count", "llm_failed_request_count",
+    "logical_inspection_count",
+    "game_action_sent_count", "game_action_confirmed_count",
+    "game_action_rejected_count", "game_action_unconfirmable_count",
+    "combat_llm_request_count", "combat_logical_inspection_count",
+    "combat_game_action_confirmed_count", "combat_turn_count",
+    "prompt_tokens", "completion_tokens", "reasoning_tokens",
+    "combat_prompt_tokens", "combat_completion_tokens",
+    "combat_reasoning_tokens",
+    "recoverable_termination_count", "bridge_reconnect_count",
+    "game_relaunch_count",
+)
+
+
+def suite_totals(state: SuiteState) -> dict:
+    """SUM of per-run ADDITIVE fields only. Derived metrics are never
+    summed/averaged here (mean of per-run p50 != pooled p50)."""
+    totals = {name: 0 for name in SUITE_ADDITIVE_FIELDS}
+    for r in state.runs:
+        m = r.get("metrics") or {}
+        for name in SUITE_ADDITIVE_FIELDS:
+            try:
+                totals[name] += int(m.get(name) or 0)
+            except (TypeError, ValueError):
+                pass
+    totals["runs"] = len(state.runs)
+    totals["valid_runs"] = sum(
+        1 for r in state.runs if r.get("benchmark_valid"))
+    totals["censored_runs"] = sum(
+        1 for r in state.runs if r.get("censored"))
+    totals["benchmark_invalid_run_ids"] = sorted(state.invalid_run_ids)
+    return totals
+
+
+def suite_derived(totals: dict) -> dict:
+    """Derived suite metrics recomputed from TOTALS only (A.1-7/10)."""
+    calls = totals.get("llm_request_count", 0)
+    confirmed = totals.get("game_action_confirmed_count", 0)
+    combat_calls = totals.get("combat_llm_request_count", 0)
+    combat_confirmed = totals.get("combat_game_action_confirmed_count", 0)
+    return {
+        "actions_per_llm_call": confirmed / calls if calls else 0.0,
+        "combat_actions_per_llm_call": (
+            combat_confirmed / combat_calls if combat_calls else 0.0),
+        # Latency distributions are NOT aggregated: pooling requires the
+        # raw samples (A.1-11). Per-run p50/p95 remain in runs[].metrics.
+        "suite_latency_aggregation": (
+            "unavailable: pooled percentiles require raw latency samples;"
+            " use per-run llm_latency_ms_p50/p95"),
+    }
+
+
 def build_report(state: SuiteState, session, t0: float,
                  validation_profile: str) -> dict:
-    metrics = (session._metrics.snapshot()
-               if session is not None else {})
+    totals = suite_totals(state)
     return {
         "validation_profile": validation_profile,
-        "final_session_metrics": metrics,
         "runs": state.runs,                    # §23: per-run slices
-        "aggregate": {                         # §23: session-level totals
+        "suite_totals": totals,                # A.1-8: additive sums
+        "suite_derived": suite_derived(totals),  # A.1-7: from totals only
+        # The last task's AgentSession metrics -- explicitly NOT a suite
+        # aggregate (formal runners create one session per task, A.1-6).
+        "last_task_session_metrics": (
+            session._metrics.snapshot() if session is not None else {}),
+        "last_task_session_metrics_is_aggregate": False,
+        "aggregate": {
             "runs_finalized": len(state.runs),
             "benchmark_invalid_runs": len(state.invalid_run_ids),
             "stop_reason": state.stop_reason,
@@ -617,8 +694,11 @@ def main(argv: list[str] | None = None) -> int:
     path = out / f"continuous_report_{time.strftime('%Y%m%d_%H%M%S')}.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
                     encoding="utf-8")
-    print("\n===== FINAL SESSION METRICS =====", flush=True)
-    print(json.dumps(report["final_session_metrics"], ensure_ascii=False,
+    print("\n===== SUITE TOTALS (additive) =====", flush=True)
+    print(json.dumps(report["suite_totals"], ensure_ascii=False,
+                     indent=2), flush=True)
+    print("===== SUITE DERIVED =====", flush=True)
+    print(json.dumps(report["suite_derived"], ensure_ascii=False,
                      indent=2), flush=True)
     print(f"REPORT WRITTEN: {path}", flush=True)
     return 0

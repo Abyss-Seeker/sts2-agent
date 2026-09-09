@@ -26,10 +26,10 @@ from benchmark_metrics import BenchmarkMetrics  # noqa: E402
 # ----------------------------------------------------------------
 
 class FakeSession:
-    # Real AgentSession assigns log seqs for the WHOLE process lifetime
-    # (start() does not reset them) -- mirror that so the runner's
-    # suite-level last_seq cursor behaves identically with fakes.
-    _shared_seq = 0
+    """Mirrors the REAL AgentSession log-seq semantics: ``_log_seq = 0``
+    lives in __init__ and start() does NOT reset it, so EVERY instance
+    restarts its seq at 1 (A.1-1). The runner must therefore keep the
+    cursor per session; fakes must NOT share a global counter."""
 
     def __init__(self, script):
         # script: list of PER-POLL steps; each status() call consumes one
@@ -40,6 +40,7 @@ class FakeSession:
         self.stops = 0
         self._metrics = BenchmarkMetrics()
         self._logs: list[dict] = []
+        self._seq = 0  # per instance, like AgentSession.__init__
         self._status = {"running": True, "run_id": None,
                         "benchmark_valid": True, "safe_to_disconnect": True}
 
@@ -52,9 +53,11 @@ class FakeSession:
         for k in ("running", "benchmark_valid", "safe_to_disconnect"):
             if k in step:
                 self._status[k] = step[k]
+        for op, kwargs in step.get("metrics_ops", []):
+            getattr(self._metrics, op)(**kwargs)
         for log in step.get("logs", []):
-            FakeSession._shared_seq += 1
-            entry = {"seq": FakeSession._shared_seq, "ts": "00:00:00",
+            self._seq += 1
+            entry = {"seq": self._seq, "ts": "00:00:00",
                      "text": log.pop("text", ""), **log}
             self._logs.append(entry)
 
@@ -511,6 +514,203 @@ class TestKeyboardInterruptCleanup(unittest.TestCase):
         report = cr.build_report(state, session, 0.0, "attached")
         self.assertEqual(report["aggregate"]["stop_reason"], "interrupted")
         self.assertIn("runs", report)
+
+
+# ----------------------------------------------------------------
+# A.1-1..5: per-session log cursor
+# ----------------------------------------------------------------
+
+def victory_script(rid, *, calls=1, actions=1):
+    """A task that records a couple of metrics, emits one run_report and
+    stops."""
+    ops = []
+    for _ in range(calls):
+        ops.append(("record_llm_request", {}))
+        ops.append(("record_llm_success", {"latency_ms": 100}))
+    for _ in range(actions):
+        ops.append(("record_action_sent", {}))
+        ops.append(("record_action_confirmed", {}))
+    return [
+        {"run_id": rid, "metrics_ops": ops,
+         "logs": [run_report_log(rid, "NORMAL_VICTORY")]},
+        {"running": False, "run_id": rid},
+    ]
+
+
+class TestPerSessionLogCursor(unittest.TestCase):
+    """A.1-1/2/3: a new AgentSession restarts its seq at 1 -- the runner
+    must reset the cursor per session or it swallows every later task's
+    logs (run_report / benchmark_invalidated / plan logs)."""
+
+    def test_realistic_per_instance_seq_resets(self):
+        s1 = FakeSession(victory_script("r1"))
+        s2 = FakeSession(victory_script("r2"))
+        s1.status()
+        s2.status()
+        self.assertEqual([e["seq"] for e in s1._logs], [1])
+        self.assertEqual([e["seq"] for e in s2._logs], [1],
+                         "each instance must restart at seq=1")
+
+    def test_formal_task_2_and_3_logs_are_collected(self):
+        """A.1-14: at least THREE tasks, so a fix that only handles the
+        first switch is caught."""
+        factory, made = fake_factory([
+            victory_script("r1"), victory_script("r2"),
+            victory_script("r3"),
+        ])
+        tasks = [{"seed": f"S{i}", "decision_mode": "action_chunk",
+                  "pair_index": i, "pair_order": 0} for i in range(3)]
+        state, _ = cr.execute_suite(
+            factory, tasks, dict(BASE_CFG), opts(), emit=lambda m: None,
+            clock=fast_clock()[0], sleep=lambda s: None)
+        self.assertEqual([r["run_id"] for r in state.runs],
+                         ["r1", "r2", "r3"])
+        self.assertEqual(len(made), 3)
+
+    def test_recoverable_same_session_cursor_continues(self):
+        """A.1-5: recovery keeps the SAME session -> the cursor must keep
+        advancing (no reset), so no log is missed or re-processed."""
+        script = [
+            {"run_id": "r1", "logs": [
+                run_report_log("r1", "RECOVERABLE_1"),
+                {"kind": "info", "text": "recovering"}]},
+            {"run_id": "r1", "running": True, "logs": [
+                {"kind": "info", "text": "resumed"}]},
+            {"run_id": "r1", "running": True, "logs": [
+                run_report_log("r1", "NORMAL_VICTORY")]},
+            {"running": False, "run_id": "r1"},
+        ]
+        factory, made = fake_factory([script])
+        tasks = [{"seed": "S1", "decision_mode": "action_chunk",
+                  "pair_index": 0, "pair_order": 0}]
+        seen = []
+        state, sess = cr.execute_suite(
+            factory, tasks, dict(BASE_CFG), opts(),
+            emit=lambda m: seen.append(m), clock=fast_clock()[0],
+            sleep=lambda s: None)
+        forwarded = [m for m in seen if m.startswith("[00:00:00]")]
+        # 4 logs total in the script: run_report(RECOVERABLE) + recovering
+        # + resumed + run_report(VICTORY) -- each forwarded exactly once.
+        self.assertEqual(len(forwarded), 4,
+                         "every log of the same session is forwarded once")
+        self.assertEqual(len(state.runs), 2)
+
+    def test_no_log_duplicates_after_recovery(self):
+        recovered = {"n": 0}
+        script = [
+            {"run_id": "r1", "logs": [
+                {"kind": "info", "text": "before-recovery"}]},
+            {"run_id": "r1", "running": True, "logs": [
+                {"kind": "info", "text": "after-recovery"}]},
+            {"run_id": "r1", "logs": [
+                run_report_log("r1", "NORMAL_VICTORY")]},
+            {"running": False, "run_id": "r1"},
+        ]
+        factory, made = fake_factory([script])
+        seen = []
+        cr.execute_suite(
+            factory, [{"seed": "S1", "decision_mode": "action_chunk",
+                       "pair_index": 0, "pair_order": 0}],
+            dict(BASE_CFG), opts(), emit=lambda m: seen.append(m),
+            clock=fast_clock()[0], sleep=lambda s: None)
+        # Count only the forwarded log lines (the runner also emits a
+        # separate "RUN REPORT: ..." summary line for the same event).
+        lines = [m for m in seen if m.startswith("[00:00:00]")]
+        self.assertEqual(
+            sum(1 for m in lines if "before-recovery" in m), 1)
+        self.assertEqual(
+            sum(1 for m in lines if "after-recovery" in m), 1)
+        self.assertEqual(
+            sum(1 for m in lines if "result=NORMAL_VICTORY" in m), 1)
+
+
+# ----------------------------------------------------------------
+# A.1-6..11: suite totals semantics
+# ----------------------------------------------------------------
+
+class TestSuiteTotals(unittest.TestCase):
+
+    def _state_with_runs(self):
+        state = cr.SuiteState()
+        # run A: 2 calls / 4 actions ; run B: 2 calls / 2 actions
+        state.runs = [
+            {"run_id": "r1", "benchmark_valid": True, "censored": False,
+             "metrics": {"llm_request_count": 2, "llm_success_count": 2,
+                         "game_action_confirmed_count": 4,
+                         "combat_llm_request_count": 2,
+                         "combat_game_action_confirmed_count": 4,
+                         "prompt_tokens": 100}},
+            {"run_id": "r2", "benchmark_valid": False, "censored": True,
+             "metrics": {"llm_request_count": 2, "llm_success_count": 1,
+                         "game_action_confirmed_count": 2,
+                         "combat_llm_request_count": 1,
+                         "combat_game_action_confirmed_count": 2,
+                         "prompt_tokens": 50}},
+        ]
+        state.invalid_run_ids = {"r2"}
+        return state
+
+    def test_suite_additive_totals_correct(self):
+        totals = cr.suite_totals(self._state_with_runs())
+        self.assertEqual(totals["llm_request_count"], 4)
+        self.assertEqual(totals["llm_success_count"], 3)
+        self.assertEqual(totals["game_action_confirmed_count"], 6)
+        self.assertEqual(totals["prompt_tokens"], 150)
+        self.assertEqual(totals["runs"], 2)
+        self.assertEqual(totals["valid_runs"], 1)
+        self.assertEqual(totals["censored_runs"], 1)
+
+    def test_suite_actions_per_call_recomputed_from_totals(self):
+        """A.1-7: suite ratio = SUM(actions)/SUM(calls) = 6/4 = 1.5, never
+        the mean of per-run ratios (which would be (2.0+1.0)/2 = 1.5 here
+        by coincidence -- assert the formula explicitly on totals)."""
+        totals = cr.suite_totals(self._state_with_runs())
+        derived = cr.suite_derived(totals)
+        self.assertAlmostEqual(derived["actions_per_llm_call"], 6 / 4)
+        self.assertAlmostEqual(
+            derived["combat_actions_per_llm_call"], 6 / 3)
+        self.assertIn("unavailable", derived["suite_latency_aggregation"])
+
+    def test_last_session_not_mislabeled_suite_total(self):
+        """A.1-6/9: the report exposes suite totals AND explicitly marks
+        the last task's session metrics as NOT an aggregate."""
+        state = self._state_with_runs()
+        factory, made = fake_factory([victory_script("r1")])
+        _, session = cr.execute_suite(
+            factory, [{"seed": "S1", "decision_mode": "action_chunk",
+                       "pair_index": 0, "pair_order": 0}],
+            dict(BASE_CFG), opts(), emit=lambda m: None,
+            clock=fast_clock()[0], sleep=lambda s: None)
+        report = cr.build_report(state, session, 0.0, "full")
+        self.assertIs(report["last_task_session_metrics_is_aggregate"], False)
+        self.assertNotIn("final_session_metrics", report)
+        # The last task's session recorded 1 call; the suite total is 4
+        # summed across runs -- proving they are different things.
+        self.assertEqual(
+            report["last_task_session_metrics"]["llm_request_count"], 1)
+        self.assertEqual(report["suite_totals"]["llm_request_count"], 4)
+        self.assertNotEqual(report["last_task_session_metrics"],
+                            report["suite_totals"])
+
+    def test_task_timeout_partial_metrics(self):
+        """A.1-12: a censored run still reports how far it got."""
+        hang = [{"run_id": "r1", "running": True,
+                 "metrics_ops": [("record_llm_request", {}),
+                                 ("record_llm_success", {"latency_ms": 50})]}]
+        factory, _ = fake_factory([hang])
+        tasks = [{"seed": "S1", "decision_mode": "action_chunk",
+                  "pair_index": 0, "pair_order": 0}]
+        clock, advance = fast_clock()
+        state, _ = cr.execute_suite(
+            factory, tasks, dict(BASE_CFG), opts(task_max_seconds=10),
+            emit=lambda m: None, clock=clock, sleep=lambda s: advance(s))
+        self.assertEqual(len(state.runs), 1)
+        r = state.runs[0]
+        self.assertEqual(r["result"], "TASK_TIMEOUT")
+        self.assertTrue(r["censored"])
+        self.assertIs(r["benchmark_valid"], False)
+        self.assertEqual(r["metrics"].get("llm_request_count"), 1,
+                         "partial evidence must be kept (A.1-12)")
 
 
 if __name__ == "__main__":
