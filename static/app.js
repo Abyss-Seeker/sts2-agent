@@ -109,7 +109,7 @@ function renderStatus(st) {
   if ($("chip-metrics")) {
     const ratio = st.actions_per_llm_call ? Number(st.actions_per_llm_call).toFixed(1) : "0";
     $("chip-metrics").textContent =
-      `调用/动作: ${st.model_call_count ?? 0}/${st.game_action_count ?? 0} (${ratio}/次)` +
+      `调用/动作: ${st.llm_request_count ?? 0}/${st.game_action_count ?? 0} (${ratio}/次)` +
       (st.benchmark_valid === false ? " · 已失效" : "");
     $("chip-metrics").className = "chip " + (st.benchmark_valid === false ? "bad" : "");
   }

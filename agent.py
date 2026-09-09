@@ -43,7 +43,7 @@ from prompts import (
     ACTION_CHUNK_CONTRACT,
     SINGLE_ACTION_CONTRACT,
 )
-from state_diff import render_delta
+from state_diff import diff_states, render_delta
 
 logger = logging.getLogger(__name__)
 
@@ -97,14 +97,38 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # invalidated and prominently logged).
     "failure_policy": "benchmark_strict",
     "action_chunk_max_actions": 16,
-    # Delta observations: intra-round checkpoint re-prompts may send a
-    # compact objective diff instead of the full state.
-    "delta_observations": True,
+    # Delta observations: OFF by default for beta correctness -- a compact
+    # diff cannot carry a newly drawn card's full human-visible face (cost,
+    # playable, displayed text, modifiers, hover/preview). Even when
+    # enabled, HAND_CHANGED / NEXT_ACTION_ILLEGAL / CARD_GONE / TARGET_GONE
+    # / POTION_INVALID checkpoints and any new hand information FORCE a
+    # full state (see _checkpoint_requires_full_state).
+    "delta_observations": False,
     # DeepSeek thinking controls (generic endpoints ignore them).
     "thinking_enabled": True,
     "reasoning_effort": "high",  # low | high | max
     "stream_mode": "off",        # off | auto | on
+    # Provider capability profile: "auto" enables native DeepSeek fields
+    # ONLY on the official api.deepseek.com hostname (never by model
+    # name); "generic" always plain; "deepseek" forces native fields.
+    "provider_profile": "auto",
 }
+
+
+def _looks_like_decision_object(obj: Any) -> bool:
+    """Whether a repaired/salvaged object plausibly carries a decision.
+
+    BOTH response contracts must be accepted here: the single-action
+    contract's top-level "action" AND the ActionChunk contract's
+    top-level "actions" list.
+    """
+    return (
+        isinstance(obj, dict)
+        and (
+            bool(obj.get("action"))
+            or isinstance(obj.get("actions"), list)
+        )
+    )
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -137,7 +161,7 @@ def extract_json(text: str) -> dict[str, Any]:
         from json_repair import repair_json
 
         obj = repair_json(cleaned, return_objects=True)
-        if isinstance(obj, dict) and obj.get("action"):
+        if _looks_like_decision_object(obj):
             return obj
     except ImportError:
         pass
@@ -152,7 +176,7 @@ def extract_json(text: str) -> dict[str, Any]:
     # "action" (or "thought") key is intact. Rebuild a JSON object from the
     # last occurrence so a decision can still be parsed; "thought" may be
     # lost, which the reasoning check handles separately.
-    for key in ('"action"', '"thought"'):
+    for key in ('"action"', '"actions"', '"thought"'):
         pos = cleaned.rfind(key)
         if pos > 0:
             candidate = cleaned[pos - 1 if cleaned[pos - 1] == "{" else pos:]
@@ -160,7 +184,7 @@ def extract_json(text: str) -> dict[str, Any]:
                 candidate = "{" + candidate
             try:
                 obj = json.loads(candidate)
-                if isinstance(obj, dict) and "action" in obj:
+                if _looks_like_decision_object(obj):
                     return obj
             except json.JSONDecodeError:
                 pass
@@ -168,7 +192,7 @@ def extract_json(text: str) -> dict[str, Any]:
                 from json_repair import repair_json
 
                 obj = repair_json(candidate, return_objects=True)
-                if isinstance(obj, dict) and obj.get("action"):
+                if _looks_like_decision_object(obj):
                     return obj
             except Exception:
                 pass
@@ -516,6 +540,8 @@ class AgentSession:
                 self._config["stream_mode"] = "off"
             if self._config.get("reasoning_effort") not in ("low", "high", "max"):
                 self._config["reasoning_effort"] = "high"
+            if self._config.get("provider_profile") not in ("auto", "generic", "deepseek"):
+                self._config["provider_profile"] = "auto"
             self._stop.clear()
             self._running = True
             self._last_error = ""
@@ -584,17 +610,56 @@ class AgentSession:
                 "agent_phase": self._agent_phase,
                 "benchmark_valid": self._metrics.benchmark_valid,
                 "invalidation_reason": self._metrics.invalidation_reason,
-                "model_call_count": self._metrics.model_call_count,
-                "game_action_count": self._metrics.game_action_count,
+                # model_call_count is a compat alias: EVERY inference
+                # request (successes AND failures/retries) counts.
+                "model_call_count": self._metrics.llm_request_count,
+                "llm_request_count": self._metrics.llm_request_count,
+                "llm_success_count": self._metrics.llm_success_count,
+                "llm_failed_request_count": self._metrics.llm_failed_request_count,
+                "logical_inspection_count": self._metrics.logical_inspection_count,
+                "model_inspection_count": self._metrics.model_inspection_count,
+                "game_action_count": self._metrics.game_action_count,  # CONFIRMED
+                "game_action_sent_count": self._metrics.game_action_sent_count,
+                "game_action_confirmed_count": self._metrics.game_action_confirmed_count,
+                "game_action_rejected_count": self._metrics.game_action_rejected_count,
                 "checkpoint_count": self._metrics.checkpoint_count,
                 "plan_completed_count": self._metrics.plan_completed_count,
                 "plan_interrupted_count": self._metrics.plan_interrupted_count,
                 "invalid_plan_count": self._metrics.invalid_plan_count,
                 "fallback_action_count": self._metrics.fallback_action_count,
                 "actions_per_llm_call": (
-                    self._metrics.game_action_count / self._metrics.model_call_count
-                    if self._metrics.model_call_count else 0.0
+                    self._metrics.game_action_confirmed_count
+                    / self._metrics.llm_request_count
+                    if self._metrics.llm_request_count else 0.0
                 ),
+                "actions_per_logical_inspection": (
+                    self._metrics.game_action_confirmed_count
+                    / self._metrics.logical_inspection_count
+                    if self._metrics.logical_inspection_count else 0.0
+                ),
+                # Real provider token/cache/reasoning usage (FIX 8).
+                "prompt_tokens": self._metrics.prompt_tokens,
+                "completion_tokens": self._metrics.completion_tokens,
+                "reasoning_tokens": self._metrics.reasoning_tokens,
+                "prompt_cache_hit_tokens": self._metrics.prompt_cache_hit_tokens,
+                "prompt_cache_miss_tokens": self._metrics.prompt_cache_miss_tokens,
+                "cache_hit_ratio": (
+                    self._metrics.prompt_cache_hit_tokens
+                    / (
+                        self._metrics.prompt_cache_hit_tokens
+                        + self._metrics.prompt_cache_miss_tokens
+                    )
+                    if (
+                        self._metrics.prompt_cache_hit_tokens
+                        + self._metrics.prompt_cache_miss_tokens
+                    ) else None
+                ),
+                "llm_latency_ms_p50": self._metrics._percentile(
+                    self._metrics.llm_latencies_ms, 0.50),
+                "first_reasoning_token_ms_p50": self._metrics._percentile(
+                    self._metrics.first_reasoning_token_ms, 0.50),
+                "first_content_token_ms_p50": self._metrics._percentile(
+                    self._metrics.first_content_token_ms, 0.50),
                 "current_plan_id": self._current_plan_id,
                 "current_plan_step": self._current_plan_step,
                 "current_plan_total": self._current_plan_total,
@@ -752,6 +817,7 @@ class AgentSession:
             thinking_enabled=bool(cfg.get("thinking_enabled", True)),
             reasoning_effort=str(cfg.get("reasoning_effort", "high")),
             stream_mode=str(cfg.get("stream_mode", "off")),
+            provider_profile=str(cfg.get("provider_profile", "auto")),
         )
         # Live streaming display hooks (no-ops for nonstreaming calls).
         llm.on_reasoning_delta = lambda d: self._set_live("reasoning", d)
@@ -786,21 +852,50 @@ class AgentSession:
                 except (ConnectionError, TimeoutError, OSError) as e:
                     self._fail(f"Bridge connection lost: {e}")
                     return
+
+                # Step A: ALWAYS reconcile a previously-sent ActionChunk
+                # action FIRST, whatever screen the new state shows. The
+                # sent action must be confirmed/rejected, checkpoint-logged
+                # and the plan finalized BEFORE routing decides anything.
+                reconcile_event = None
+                if (
+                    cfg.get("decision_mode") == "action_chunk"
+                    and self._plan_executor.inflight is not None
+                ):
+                    reconcile_event = self._reconcile_inflight_if_any(state)
+
+                # Step B: route the newly observed screen.
+                stype = str(state.get("type", "unknown"))
+                if stype in TERMINAL_SCREEN_TYPES:
+                    self._plan_executor.reset()
+                    self._agent_phase = "terminal"
+                    self._log("info", "Run finished; agent stopping.")
+                    # AUTO-RESUME: the run's save is kept, so wait for the
+                    # game to come back instead of tearing the session down.
+                    # The mod resumes the saved run on its own (it clicks
+                    # "Continue" on the main menu).
+                    if not self._maybe_resume():
+                        break
+                    continue
                 try:
                     if (
                         cfg.get("decision_mode") == "action_chunk"
-                        and str(state.get("type")) == BridgeStateType.COMBAT_ACTION
+                        and stype == BridgeStateType.COMBAT_ACTION
                     ):
                         # Beta: combat turns may run a pending ActionChunk
-                        # across multiple bridge handshakes.
+                        # across multiple bridge handshakes. A possible
+                        # in-flight action was ALREADY reconciled in Step A
+                        # -- never accept_state() the same state twice.
                         self._handle_combat_chunk_state(
                             state, llm, chunk_system_prompt, hard_deadline,
                             llm_call_cap=llm_timeout + 1.0,
+                            reconcile_event=reconcile_event,
                         )
                     else:
                         # Noncombat screens and single_action mode keep the
-                        # original one-choice path. A screen change always
-                        # invalidates any pending plan.
+                        # original one-choice path. Any old combat plan was
+                        # already reconciled above (checkpoint-logged, plan
+                        # finalized); it must not survive a screen change.
                         self._plan_executor.reset()
                         self._handle_state(
                             state, llm, single_system_prompt, hard_deadline,
@@ -816,17 +911,6 @@ class AgentSession:
                     )
                     self._stop.set()
                     return
-                if str(state.get("type")) in TERMINAL_SCREEN_TYPES:
-                    self._plan_executor.reset()
-                    self._agent_phase = "terminal"
-                    self._log("info", "Run finished; agent stopping.")
-                    # AUTO-RESUME: the run's save is kept, so wait for the
-                    # game to come back instead of tearing the session down.
-                    # The mod resumes the saved run on its own (it clicks
-                    # "Continue" on the main menu).
-                    if not self._maybe_resume():
-                        break
-                    continue
         finally:
             if self._log_file is not None:
                 self._log_file.close()
@@ -944,6 +1028,34 @@ class AgentSession:
                 if len(self._live_content) > 4000:
                     self._live_content = self._live_content[-2000:]
 
+    def _checkpoint_requires_full_state(
+        self,
+        previous_model_state: dict[str, Any] | None,
+        current_state: dict[str, Any],
+        checkpoint_reason: str,
+    ) -> bool:
+        """Whether a checkpoint re-prompt must send the FULL state.
+
+        Correctness first: any reason that involves unresolved/new card or
+        target identity, or any newly visible hand information, must give
+        the model the complete human-visible card faces -- a compact delta
+        cannot express cost/playable/displayed text/modifiers of NEW cards.
+        """
+        if previous_model_state is None:
+            return True
+        if checkpoint_reason in {
+            "HAND_CHANGED",
+            "NEXT_ACTION_ILLEGAL",
+            "CARD_GONE",
+            "TARGET_GONE",
+            "POTION_INVALID",
+        }:
+            return True
+        delta = diff_states(previous_model_state, current_state)
+        if delta.hand_added_information:
+            return True
+        return False
+
     def _model_observation_text(self, state: dict[str, Any]) -> str:
         """FULL or compact DELTA model observation (objective diffs only).
 
@@ -953,11 +1065,12 @@ class AgentSession:
         prev = self._last_model_observation_state
         reason = self._last_checkpoint_reason
         if (
-            self._config.get("delta_observations", True)
+            self._config.get("delta_observations", False)
             and prev is not None
             and reason
             and str(prev.get("type")) == str(state.get("type"))
             and reason in {r.value for r in self._INTRA_ROUND_CHECKPOINTS}
+            and not self._checkpoint_requires_full_state(prev, state, reason)
         ):
             executed = " -> ".join(self._last_plan_executed[-4:]) or "(none)"
             text = render_delta(
@@ -974,6 +1087,29 @@ class AgentSession:
             return text
         return format_state(state, self._memory, response_mode="action_chunk")
 
+    def _reconcile_inflight_if_any(self, state: dict[str, Any]) -> Any:
+        """Step A of the main loop: reconcile the authoritative result of
+        the previously sent plan action, whatever screen the new state
+        shows. Returns the ExecutorEvent (never None when called).
+
+        Action accounting: the sent action is either CONFIRMED by the
+        authoritative next state (the visible world moved forward --
+        screen changes / new turns / terminal all count) or REJECTED
+        (action-relevantly unchanged state). A connection lost before the
+        next state is never counted as confirmed.
+        """
+        executor = self._plan_executor
+        event = executor.accept_state(state)
+        if (
+            event.checkpoint is not None
+            and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
+        ):
+            self._metrics.record_action_rejected()
+        else:
+            self._metrics.record_action_confirmed()
+        self._consume_executor_event(event, state)
+        return event
+
     def _handle_combat_chunk_state(
         self,
         state: dict[str, Any],
@@ -981,16 +1117,29 @@ class AgentSession:
         chunk_system_prompt: str,
         hard_deadline: float,
         llm_call_cap: float,
+        reconcile_event: Any = None,
     ) -> None:
         stype = str(state.get("type", "unknown"))
         self._current_state_type = stype
         self._memory.observe(state)
         executor = self._plan_executor
 
-        if executor.inflight is not None:
-            # This state is the authoritative result of the action we sent.
+        # The main loop already reconciled a possibly in-flight action in
+        # Step A (reconcile_event). Never accept_state() the same state
+        # twice -- only fall back to a local reconcile defensively.
+        event = reconcile_event
+        if event is None and executor.inflight is not None:
             event = executor.accept_state(state)
+            if (
+                event.checkpoint is not None
+                and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
+            ):
+                self._metrics.record_action_rejected()
+            else:
+                self._metrics.record_action_confirmed()
             self._consume_executor_event(event, state)
+
+        if event is not None:
             if event.status == ExecutorStatus.TERMINAL:
                 return
             if event.status == ExecutorStatus.READY_ACTION:
@@ -1014,6 +1163,8 @@ class AgentSession:
         # Never call the LLM before trying to continue a valid pending plan
         # -- that is the entire performance win.
         self._agent_phase = "thinking"
+        # One cognitive boundary per state that needs the model.
+        self._metrics.record_inspection()
         decision_deadline = time.monotonic() + hard_deadline
         try:
             attempts = max(1, int(self._config.get("decision_attempts", 3)))
@@ -1124,6 +1275,9 @@ class AgentSession:
                     ),
                 })
             call_budget = min(remaining - send_margin, llm_call_cap)
+            # Count EVERY inference attempt BEFORE the request, so
+            # timeouts / HTTP errors / abandoned attempts are costed too.
+            self._metrics.record_llm_request()
             try:
                 t0 = time.monotonic()
                 raw_reply = self._chat_with_deadline(llm, messages, call_budget)
@@ -1132,6 +1286,7 @@ class AgentSession:
                     self._log("info", f"LLM 响应耗时 {llm_ms / 1000:.1f}s（较慢）")
                 self._llm_fail_streak = 0
             except EmptyContentError as e:
+                self._metrics.record_llm_failure()
                 # Thinking-only reply: warn + retry with a precise hint.
                 self._log(
                     "warning",
@@ -1159,15 +1314,19 @@ class AgentSession:
                 prev_chunk_json = ""
                 continue
             except LLMError as e:
+                self._metrics.record_llm_failure()
                 self._last_model_failure_reason = f"LLM API error: {e}"
                 self._log("error", f"LLM API error: {e}")
                 return None
             except Exception as e:
+                self._metrics.record_llm_failure()
                 self._last_model_failure_reason = f"unexpected LLM client error: {e}"
                 self._log("error", f"LLM 客户端意外错误: {e}")
                 return None
-            self._metrics.record_model_call(
+            self._metrics.record_llm_success(
                 latency_ms=llm_ms,
+                first_reasoning_ms=getattr(llm, "first_reasoning_ms", None),
+                first_content_ms=getattr(llm, "first_content_ms", None),
                 usage=getattr(llm, "last_usage", None) or None,
             )
             try:
@@ -1255,10 +1414,12 @@ class AgentSession:
     def _send_prepared_plan_step(
         self, prepared: Any, state: dict[str, Any]
     ) -> None:
-        """Mark + send ONE individually bridge-confirmed plan step."""
+        """Mark + send ONE plan step. This only proves ACTION SENT; the
+        CONFIRMED accounting happens in _reconcile_inflight_if_any() when
+        the authoritative next state arrives."""
         self._plan_executor.mark_sent(prepared, state)
         result = self._execute(prepared.bridge_action)
-        self._metrics.record_game_action(from_plan=True)
+        self._metrics.record_action_sent(from_plan=True)
         self._current_plan_step = prepared.step_index + 1
         self._plan_executed.append(prepared.description)
         self._agent_phase = "executing_plan"
@@ -1287,14 +1448,19 @@ class AgentSession:
         if cp is None or cp.reason is CheckpointReason.NONE:
             return
         reason = cp.reason
+        # Plan completion and checkpoint reason are TWO DIFFERENT
+        # dimensions (review fix): a plan whose last action moved the game
+        # to a new turn / new screen / terminal is COMPLETED even though
+        # the checkpoint reason is NEW_TURN / SCREEN_CHANGED / TERMINAL.
+        # Only the ExecutorEvent's plan_completed flag knows whether the
+        # chunk was exhausted when the checkpoint fired.
+        completed = bool(getattr(event, "plan_completed", False))
         executed = list(self._plan_executed)
         self._last_plan_executed = executed
         self._last_checkpoint_reason = reason.value
-        if reason is CheckpointReason.PLAN_COMPLETE:
+        if completed:
             self._metrics.record_plan_complete()
-            self._metrics.record_checkpoint(reason.value, interrupted=False)
-        else:
-            self._metrics.record_checkpoint(reason.value, interrupted=True)
+        self._metrics.record_checkpoint(reason.value, interrupted=not completed)
         remaining = max(0, self._current_plan_total - len(executed))
         self._log(
             "plan_checkpoint",
@@ -1302,15 +1468,15 @@ class AgentSession:
             reason=reason.value,
             plan_id=event.completed_plan_id or self._current_plan_id,
             executed_steps=len(executed),
-            remaining_steps_discarded=(
-                0 if reason is CheckpointReason.PLAN_COMPLETE else remaining
-            ),
+            remaining_steps_discarded=0 if completed else remaining,
+            plan_completed=completed,
         )
         self._add_plan_level_context(
             event.completed_plan_id or self._current_plan_id,
             executed,
             reason,
             cp.detail,
+            completed,
         )
         # Reset per-plan bookkeeping (a fresh chunk sets it again).
         self._plan_executed = []
@@ -1326,6 +1492,7 @@ class AgentSession:
         executed: list[str],
         reason: CheckpointReason,
         detail: str,
+        completed: bool,
     ) -> None:
         """Store ONE plan-level history turn per LLM plan -- never one turn
         per mechanically executed card."""
@@ -1335,7 +1502,7 @@ class AgentSession:
         if self._current_plan_thought:
             lines.append(f"MODEL PLAN: {self._current_plan_thought}")
         lines.append("EXECUTED: " + ("; ".join(executed) if executed else "(none)"))
-        if reason is CheckpointReason.PLAN_COMPLETE:
+        if completed:
             lines.append("RESULT: Plan completed.")
         else:
             lines.append(
@@ -1347,9 +1514,7 @@ class AgentSession:
             "thought": self._current_plan_thought,
             "executed": executed,
             "result": (
-                "completed"
-                if reason is CheckpointReason.PLAN_COMPLETE
-                else f"interrupted:{reason.value}"
+                "completed" if completed else f"interrupted:{reason.value}"
             ),
         }, ensure_ascii=False)
         self._ctx.add_decision(
@@ -1376,7 +1541,7 @@ class AgentSession:
             self._stop.set()
             return
         act = self._fallback_action(state)
-        result = self._execute(act)
+        result = self._execute_counted(act)
         self._metrics.record_fallback(reason)
         self._decision_count += 1
         self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
@@ -1525,6 +1690,8 @@ class AgentSession:
         # state. Retries use whatever time is left; they can never push the
         # total decision past the game's window.
         decision_deadline = time.monotonic() + hard_deadline
+        # One cognitive boundary per state that needs the model.
+        self._metrics.record_inspection()
         feedback = ""
         prev_action_json = ""
         act: dict[str, Any] | None = None
@@ -1565,6 +1732,9 @@ class AgentSession:
             # Single-call cap = configured llm_timeout (a per-call limit),
             # never more than the remaining decision time.
             call_budget = min(remaining - send_margin, llm_call_cap)
+            # Count EVERY inference attempt BEFORE the request (FIX:
+            # failed/abandoned/retried calls must not escape accounting).
+            self._metrics.record_llm_request()
             try:
                 t0 = time.monotonic()
                 raw_reply = self._chat_with_deadline(llm, messages, call_budget)
@@ -1573,6 +1743,7 @@ class AgentSession:
                     self._log("info", f"LLM 响应耗时 {llm_ms / 1000:.1f}s（较慢）")
                 self._llm_fail_streak = 0
             except EmptyContentError as e:
+                self._metrics.record_llm_failure()
                 # The model emitted ONLY thinking and no answer text
                 # (typically its reasoning consumed max_tokens and the reply
                 # was truncated). This is a MODEL OUTPUT problem, not an API
@@ -1611,6 +1782,7 @@ class AgentSession:
                 raw_reply = ""
                 continue
             except LLMError as e:
+                self._metrics.record_llm_failure()
                 # Strict benchmark mode: NO fallback, invalidate + stop.
                 if self._config.get("failure_policy", "benchmark_strict") == "benchmark_strict":
                     self._handle_model_failure(state, f"LLM API error: {e}")
@@ -1627,7 +1799,7 @@ class AgentSession:
                     self._stop.set()
                     return
                 act = self._fallback_action(state)
-                result_note = self._execute(act)
+                result_note = self._execute_counted(act)
                 self._metrics.record_fallback(f"LLM API error: {e}")
                 self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
                 self._decision_count += 1
@@ -1641,11 +1813,14 @@ class AgentSession:
                 self._ctx.add_decision(state_text, json.dumps(act), result_note)
                 return
             except Exception as e:
+                self._metrics.record_llm_failure()
                 self._fail(f"LLM 客户端意外错误: {e}")
                 self._stop.set()
                 return
-            self._metrics.record_model_call(
+            self._metrics.record_llm_success(
                 latency_ms=llm_ms if llm_ms is not None else None,
+                first_reasoning_ms=getattr(llm, "first_reasoning_ms", None),
+                first_content_ms=getattr(llm, "first_content_ms", None),
                 usage=getattr(llm, "last_usage", None) or None,
             )
             try:
@@ -1702,8 +1877,7 @@ class AgentSession:
 
         if act is not None:
             self._metrics.record_plan(1)
-        result_note = self._execute(act)
-        self._metrics.record_game_action(from_plan=False)
+        result_note = self._execute_counted(act)
         self._decision_count += 1
         self._log(
             "decision",
@@ -1767,6 +1941,16 @@ class AgentSession:
             return "(已隐藏思考)"
         # Unknown mode fallback
         return raw_reply.strip()[:300] if raw_reply else "(fallback)"
+
+    def _execute_counted(self, act: dict[str, Any]) -> str:
+        """Single-mode execution accounting: the bridge is synchronous, so
+        a successfully transmitted action is counted sent + confirmed; a
+        connection failure counts sent only (never confirmed)."""
+        result = self._execute(act)
+        self._metrics.record_action_sent(from_plan=False)
+        if not str(result).startswith("ERROR"):
+            self._metrics.record_action_confirmed()
+        return result
 
     def _execute(self, act: dict[str, Any]) -> str:
         assert self._client is not None

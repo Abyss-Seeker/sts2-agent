@@ -68,16 +68,38 @@ server.py + static/     # 本地 Web UI（配置 API/模板、观测决策日志
   LLM 成绩。
 
 ### 指标
-UI/状态接口区分 **模型调用（model_call_count）** 与 **游戏动作
-（game_action_count）**，并给出 `actions_per_llm_call`、检查点直方图、
-计划完成/中断比、token 与缓存命中、`benchmark_valid` 等（`/api/status`）。
-核心 KPI：`actions_per_llm_call > 1` 且不增加非法动作率、无隐藏信息。
+严格区分四个维度（`/api/status`）：
+- **推理请求**：`llm_request_count`（每一次真实 HTTP 推理尝试，含超时/
+  HTTP 错误/thinking-only/坏 JSON 重试）、`llm_success_count`、
+  `llm_failed_request_count`、`logical_inspection_count`（认知边界数）；
+- **游戏动作**：`game_action_sent_count`（已发送）、
+  `game_action_confirmed_count`（被下一权威状态确认；`game_action_count`
+  为其兼容别名）、`game_action_rejected_count`（状态无变化被拒）；
+- **计划**：完成/中断分开统计——计划是否完成与检查点原因是两个独立维度
+  （最后一击把战斗带进 reward_screen 时 reason=SCREEN_CHANGED 但
+  plan_completed=true）；
+- **成本/延迟**：`prompt_tokens`、`completion_tokens`、
+  `reasoning_tokens`、`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`
+  与 `cache_hit_ratio`（官方 DeepSeek usage）、首 token 延迟
+  `first_reasoning_token_ms_p50` / `first_content_token_ms_p50`（流式下
+  每次调用只记一次）。
+
+核心 KPI：`actions_per_llm_call > 1`（分母含失败请求），且不增加非法动作
+率、无隐藏信息。
 
 ### DeepSeek 能力（可选）
-`thinking_enabled` / `reasoning_effort`（low|high|max）仅在官方 DeepSeek
-端点生效（自动能力探测，不会发给通用 OpenAI 兼容中转）；`stream_mode`
-默认 `off`（部分中转的流式重组会损坏内容），`on`/`auto` 时也只执行
-**完整**回复，绝不解析流式半截 JSON。
+`thinking_enabled` / `reasoning_effort`（low|high|max）通过
+`provider_profile` 控制是否下发：`auto`（默认）**仅当主机名是官方
+api.deepseek.com 时**启用，绝不凭模型名猜测（中转上跑
+`deepseek-*` 模型仍是普通 OpenAI 兼容端点）；`generic` 永远不发；
+`deepseek` 显式强制开启。`stream_mode` 默认 `off`（部分中转的流式重组会
+损坏内容），`on`/`auto` 时也只执行**完整**回复，绝不解析流式半截 JSON。
+
+### Delta 观测策略（正确性优先）
+`delta_observations` 默认 **关闭**。即使打开，凡涉及新牌/引用失效的检查点
+（HAND_CHANGED / NEXT_ACTION_ILLEGAL / CARD_GONE / TARGET_GONE /
+POTION_INVALID）以及任何新增手牌信息都**强制发送完整状态**——紧凑 delta
+无法承载新卡的完整人眼可见信息（费用/可打性/显示文本/附魔/hover）。
 
 ### 信息对等（human parity，保持不变）
 模型只能看到真人玩家在当前界面能看到的信息：无抽牌堆顺序、无 RNG、

@@ -1,17 +1,25 @@
 """Beta E2E: action_chunk mode over a fake bridge + scripted MockLLM.
 
-Implements the full-agent-loop acceptance tests from the worker prompt:
+Acceptance tests (review-remediated semantics):
 
-  TEST 1  one model call drives multiple bridge actions (the single most
-          important acceptance test: MockLLM.calls == 1, actions == 3)
-  TEST 2  draw creates a HAND_CHANGED checkpoint -> plan interrupted,
-          remainder discarded, second model call
-  TEST 7  action rejected (action-relevantly unchanged state) -> no
-          automatic replay loop, the model regains control
-  TEST 9  explicit "checkpoint_after": true stops the chunk after ONE
-          action even without any other diff
-  TEST 10 strict failure: LLM timeout -> no non-LLM fallback action,
-          benchmark invalidated, agent stops
+  TEST 1  one LLM plan -> Strike -> Defend -> EndTurn, followed by the
+          post-EndTurn authoritative ROUND 2 state. The first plan is
+          1 logical plan, 3 sent + 3 CONFIRMED actions, plan completed
+          (not interrupted) with checkpoint reason NEW_TURN.
+  TEST 1b draw checkpoint re-prompt must contain the FULL human-visible
+          face of the NEW card (cost / playable / displayed text) --
+          BLOCKER 1: forced-full observation.
+  TEST 3  combat action followed by card_select: the in-flight action is
+          reconciled (confirmed, checkpoint SCREEN_CHANGED, old plan
+          discarded) BEFORE routing; card_select goes through the normal
+          noncombat choice path; no stale combat action is executed.
+  TEST 4  lethal action followed by reward_screen: in-flight action
+          confirmed and the chunk exhausted -> plan COMPLETED.
+  TEST 5  unchanged state after play: sent += 1, confirmed += 0,
+          rejected += 1, no automatic replay.
+  TEST 6  API timeout (strict): llm_request_count and
+          llm_failed_request_count increase, benchmark invalid, ZERO
+          fallback strategic actions.
 
 Run:  python .\\tests\\test_beta_e2e.py
 """
@@ -83,6 +91,28 @@ def combat_state(
     }
 
 
+def card_select_state(request_id: str) -> dict:
+    return {
+        "type": "card_select",
+        "request_id": request_id,
+        "floor": 1, "act": 1,
+        "min_select": 1, "max_select": 1,
+        "options": [{"index": 0, "label": "Exhaust target", "enabled": True}],
+    }
+
+
+def reward_screen_state(request_id: str) -> dict:
+    return {
+        "type": "reward_screen",
+        "request_id": request_id,
+        "floor": 1, "act": 1,
+        "options": [
+            {"index": 0, "label": "Gold", "enabled": True},
+            {"index": 1, "label": "proceed", "enabled": True},
+        ],
+    }
+
+
 class FakeBridge(threading.Thread):
     """Sends a scripted list of states, collecting the agent's actions."""
 
@@ -142,24 +172,28 @@ class FakeBridge(threading.Thread):
 
 
 class MockLLM(agent_mod.LLMClient):
-    """Scripted responses; counts API calls."""
+    """Scripted responses (class attr `script`); records every prompt."""
+
+    script: list[str] = []
+    fail = False
 
     def __init__(self, *a, **k):
         super().__init__(base_url="http://mock", api_key="", model="mock")
         self.calls = 0
-        self.fail = False
-
-    def pick(self, last: str) -> str:  # overridden per test
-        raise NotImplementedError
+        self.prompts: list[str] = []
 
     def chat(self, messages):
         self.calls += 1
+        self.prompts.append(messages[-1]["content"])
         if self.fail:
             raise LLMError("simulated LLM timeout")
-        return self.pick(messages[-1]["content"])
+        if self.script:
+            return self.script.pop(0)
+        raise AssertionError("unexpected extra LLM call")
 
 
-def run_agent(port: int, llm_cls, cfg: dict | None = None, states: list[dict] | None = None):
+def run_agent(port: int, llm_cls, cfg: dict | None = None,
+              states: list[dict] | None = None):
     bridge = FakeBridge(port, states or [])
     bridge.start()
 
@@ -185,7 +219,7 @@ def wait_until(predicate, timeout: float = 12.0, step: float = 0.1) -> bool:
     return False
 
 
-CHUNK1 = json.dumps({
+CHUNK_STRIKE_DEFEND_END = json.dumps({
     "thought": "attack, defend, end",
     "actions": [
         {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
@@ -193,16 +227,43 @@ CHUNK1 = json.dumps({
         {"kind": "end_turn"},
     ],
 })
+CHUNK_END_TURN = json.dumps({
+    "thought": "nothing worth doing",
+    "actions": [{"kind": "end_turn"}],
+})
+CHUNK_POMMEL = json.dumps({
+    "thought": "pommel first; drawn card may change the turn",
+    "actions": [
+        {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
+        {"kind": "play", "card_ref": "h1", "target_ref": "e0"},
+        {"kind": "end_turn"},
+    ],
+})
+CHUNK_STRIKE_ONCE = json.dumps({
+    "thought": "strike once",
+    "actions": [{"kind": "play", "card_ref": "h0", "target_ref": "e0"}],
+})
+CHUNK_STRIKE_INSPECT = json.dumps({
+    "thought": "play once, then inspect",
+    "actions": [{
+        "kind": "play", "card_ref": "h0", "target_ref": "e0",
+        "checkpoint_after": True,
+    }],
+})
+CHOOSE_0 = json.dumps({
+    "thought": "pick the visible option",
+    "action": "choose",
+    "index": 0,
+})
 
 
 # ----------------------------------------------------------------
-# TEST 1 — one model call, multiple bridge actions
+# TEST 1 — one plan -> 3 sent + 3 CONFIRMED actions, plan completed
 # ----------------------------------------------------------------
 
-def test_one_call_multiple_actions() -> None:
+def test_one_plan_three_confirmed_actions() -> None:
     class LLM(MockLLM):
-        def pick(self, last: str) -> str:
-            return CHUNK1
+        script = [CHUNK_STRIKE_DEFEND_END, CHUNK_END_TURN]
 
     s0 = combat_state("r0", energy=3,
                       hand=[card("STRIKE", target="AnyEnemy"), card("DEFEND")])
@@ -210,104 +271,195 @@ def test_one_call_multiple_actions() -> None:
                       enemies=[cultist(34)], discard_count=1)
     s2 = combat_state("r2", energy=1, hand=[], enemies=[cultist(34)],
                       block=5, discard_count=2)
+    # Post-EndTurn authoritative state: round 2, new hand / new energy.
+    s3 = combat_state("r3", energy=3, round_=2,
+                      hand=[card("STRIKE", target="AnyEnemy")],
+                      enemies=[cultist(34)], draw_count=3, discard_count=2)
 
-    s, bridge = run_agent(9121, LLM, states=[s0, s1, s2])
-    ok = wait_until(lambda: not s.status()["running"])
+    s, bridge = run_agent(9121, LLM, states=[s0, s1, s2, s3])
+    wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
+    logs = s.logs_since(0)
 
-    assert len(bridge.actions) == 3, bridge.actions
+    # First plan drove exactly these three actions, in order.
     assert bridge.actions[0] == {"action": "play", "card_index": 0, "target_index": 0}
     # h1 (DEFEND) shifted from index 1 to current index 0 and must resolve.
     assert bridge.actions[1] == {"action": "play", "card_index": 0, "target_index": -1}
     assert bridge.actions[2] == {"action": "end_turn"}
-    assert st["model_call_count"] == 1, st
-    assert st["game_action_count"] == 3, st
-    assert st["actions_per_llm_call"] == 3.0, st
-    assert st["benchmark_valid"], st
-    assert ok or not st["running"]  # agent finished without hanging
-    print("PASS TEST 1 one_call_multiple_actions")
+    # The harness legitimately started a second plan after round 2.
+    assert bridge.actions[3] == {"action": "end_turn"}
+
+    # Sent == confirmed accounting: the first plan's 3 actions were all
+    # confirmed by S1/S2/S3 (the 4th action's confirming state never came
+    # because the fake bridge closes -- it is sent but NOT confirmed).
+    assert st["game_action_sent_count"] == 4, st
+    assert st["game_action_confirmed_count"] == 3, st
+    assert st["game_action_rejected_count"] == 0, st
+    # 1 logical plan for the first chunk; 2 inference requests total.
+    assert st["llm_request_count"] == 2, st
+    assert st["llm_success_count"] == 2, st
+    assert st["llm_failed_request_count"] == 0, st
+    # The first plan COMPLETED (chunk exhausted) -- the NEW_TURN checkpoint
+    # must NOT be counted as an interruption (review fix).
+    assert st["plan_completed_count"] == 1, st
+    assert st["plan_interrupted_count"] == 0, st
+    assert st["last_checkpoint_reason"] == "NEW_TURN", st
+    cps = [e for e in logs if e["kind"] == "plan_checkpoint"
+           and e.get("reason") == "NEW_TURN"]
+    assert len(cps) == 1 and cps[0]["executed_steps"] == 3, cps
+    assert cps[0].get("plan_completed") is True, cps
+    print("PASS TEST 1 one_plan_three_confirmed_actions")
 
 
 # ----------------------------------------------------------------
-# TEST 2 — draw creates a checkpoint (HAND_CHANGED)
+# TEST 1b — draw checkpoint re-prompt carries FULL new card info
 # ----------------------------------------------------------------
 
-def test_draw_causes_checkpoint() -> None:
+def test_draw_checkpoint_reprompt_contains_full_new_card_information() -> None:
     class LLM(MockLLM):
-        def pick(self, last: str) -> str:
-            if "CHECKPOINT UPDATE" in last:
-                return json.dumps({
-                    "thought": "replan after the draw",
-                    "actions": [{"kind": "end_turn"}],
-                })
-            return json.dumps({
-                "thought": "pommel first; drawn card may change the turn",
-                "actions": [
-                    {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
-                    {"kind": "play", "card_ref": "h1", "target_ref": "e0"},
-                    {"kind": "end_turn"},
-                ],
-            })
+        script = [CHUNK_POMMEL, CHUNK_END_TURN]
 
     s0 = combat_state("r0", energy=3,
                       hand=[card("POMMEL_STRIKE", target="AnyEnemy"),
                             card("STRIKE", target="AnyEnemy")])
-    # After Pommel Strike a NEW card (BASH) became visible -> checkpoint.
+    bash = card("BASH", target="AnyEnemy", cost=2)
+    bash["current_display_text"] = "Deal 10 damage. Apply 2 Vulnerable."
     s1 = combat_state("r1", energy=2,
-                      hand=[card("STRIKE", target="AnyEnemy"),
-                            card("BASH", target="AnyEnemy", cost=2)],
+                      hand=[card("STRIKE", target="AnyEnemy"), bash],
                       enemies=[cultist(31)], discard_count=1)
 
     s, bridge = run_agent(9122, LLM, states=[s0, s1])
-    wait_until(lambda: len(bridge.actions) >= 2 or not s.status()["running"])
+    wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
 
-    # Only the Pommel Strike executed from the OLD plan; the rest was
-    # discarded and the model was re-consulted (2 API calls total).
-    assert bridge.actions[0] == {"action": "play", "card_index": 0, "target_index": 0}
-    assert bridge.actions[-1] == {"action": "end_turn"}, bridge.actions
-    assert len(bridge.actions) == 2, bridge.actions
-    assert st["model_call_count"] == 2, st
-    assert st["checkpoint_count"] >= 1, st
+    assert len(llm_prompts(s)) == 2
+    second = llm_prompts(s)[1]
+    # The model must be able to inspect the NEW card like a human would:
+    # identity, current cost, playability and its current displayed text.
+    assert "BASH" in second, second
+    assert "Current cost: 2 energy" in second, second
+    assert "Playable now: YES" in second, second
+    assert "Deal 10 damage" in second, second
+    # A FULL state was sent -- not a bare delta with only "+h Bash".
+    assert "HAND (one entry per card" in second, second
+    assert "CHECKPOINT UPDATE" not in second, second
     assert st["last_checkpoint_reason"] == "HAND_CHANGED", st
-    assert st["plan_interrupted_count"] >= 1, st
-    print("PASS TEST 2 draw_causes_checkpoint")
+    print("PASS TEST 1b draw_checkpoint_full_card_information")
+
+
+def llm_prompts(s: AgentSession) -> list[str]:
+    llm = s._llm
+    return list(getattr(llm, "prompts", []))
 
 
 # ----------------------------------------------------------------
-# TEST 7 — action rejected / unchanged state: no replay loop
+# TEST 3 — combat action followed by card_select: reconcile FIRST
+# ----------------------------------------------------------------
+
+def test_screen_change_reconciles_inflight_before_routing() -> None:
+    class LLM(MockLLM):
+        script = [
+            json.dumps({
+                "thought": "play, then end",
+                "actions": [
+                    {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
+                    {"kind": "end_turn"},
+                ],
+            }),
+            CHOOSE_0,  # card_select handled by the normal choice path
+        ]
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s1 = card_select_state("r1")
+
+    s, bridge = run_agent(9126, LLM, states=[s0, s1])
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    # The sent play was reconciled (confirmed + checkpoint-logged) even
+    # though the NEXT screen is a card_select; the executor did NOT get a
+    # silent reset before reconciliation.
+    assert bridge.actions == [
+        {"action": "play", "card_index": 0, "target_index": 0},
+        {"action": "choose", "index": 0},
+    ], bridge.actions
+    assert st["game_action_confirmed_count"] >= 1, st
+    assert st["game_action_rejected_count"] == 0, st
+    assert st["last_checkpoint_reason"] == "SCREEN_CHANGED", st
+    # Old plan discarded (interrupted), never executed further.
+    assert st["plan_interrupted_count"] == 1, st
+    assert st["plan_completed_count"] == 0, st
+    # card_select went through the NORMAL noncombat choice path.
+    logs = s.logs_since(0)
+    assert any(e["kind"] == "decision" and e.get("state_type") == "card_select"
+               for e in logs), logs
+    # No second combat action was executed from the old chunk.
+    assert not any(a.get("action") == "end_turn" for a in bridge.actions)
+    print("PASS TEST 3 screen_change_reconciles_inflight")
+
+
+# ----------------------------------------------------------------
+# TEST 4 — lethal action followed by reward_screen: plan COMPLETED
+# ----------------------------------------------------------------
+
+def test_lethal_action_reward_screen_plan_completed() -> None:
+    class LLM(MockLLM):
+        script = [CHUNK_STRIKE_ONCE, CHOOSE_0]
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s1 = reward_screen_state("r1")
+
+    s, bridge = run_agent(9127, LLM, states=[s0, s1])
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    assert bridge.actions == [
+        {"action": "play", "card_index": 0, "target_index": 0},
+        {"action": "choose", "index": 0},
+    ], bridge.actions
+    # The single planned action was confirmed and the chunk was exhausted:
+    # plan COMPLETED even though the checkpoint reason is SCREEN_CHANGED.
+    assert st["game_action_confirmed_count"] >= 1, st
+    assert st["game_action_rejected_count"] == 0, st
+    assert st["plan_completed_count"] == 1, st
+    assert st["plan_interrupted_count"] == 0, st
+    assert st["last_checkpoint_reason"] == "SCREEN_CHANGED", st
+    print("PASS TEST 4 lethal_action_reward_screen_plan_completed")
+
+
+# ----------------------------------------------------------------
+# TEST 5 — unchanged state after play: sent/confirmed/rejected split
 # ----------------------------------------------------------------
 
 def test_rejected_action_no_replay() -> None:
     class LLM(MockLLM):
-        def pick(self, last: str) -> str:
-            if "CHECKPOINT UPDATE" in last:
-                return json.dumps({
-                    "thought": "the model regained control",
-                    "actions": [{"kind": "end_turn"}],
-                })
-            return json.dumps({
-                "thought": "strike once",
-                "actions": [{"kind": "play", "card_ref": "h0", "target_ref": "e0"}],
-            })
+        script = [CHUNK_STRIKE_ONCE, CHUNK_END_TURN]
 
     s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
     # Same visible state, new request_id -> the mod rejected the action.
     s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
 
     s, bridge = run_agent(9123, LLM, states=[s0, s1])
-    wait_until(lambda: len(bridge.actions) >= 2 or not s.status()["running"])
+    wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
 
     plays = [a for a in bridge.actions if a.get("action") == "play"]
     assert len(plays) == 1, bridge.actions  # never replayed blindly
     assert bridge.actions[-1] == {"action": "end_turn"}, bridge.actions
-    assert st["model_call_count"] == 2, st
+    assert st["llm_request_count"] == 2, st
+    # SENT vs CONFIRMED vs REJECTED: the play was sent once and REJECTED
+    # (confirmed += 0); the follow-up end_turn was sent but its
+    # confirming state never arrived (fake bridge closes).
+    assert st["game_action_sent_count"] == 2, st
+    assert st["game_action_confirmed_count"] == 0, st
+    assert st["game_action_rejected_count"] == 1, st
     assert st["last_checkpoint_reason"] == "ACTION_REJECTED", st
-    print("PASS TEST 7 rejected_action_no_replay")
+    print("PASS TEST 5 rejected_action_no_replay")
 
 
 # ----------------------------------------------------------------
@@ -316,44 +468,32 @@ def test_rejected_action_no_replay() -> None:
 
 def test_explicit_checkpoint() -> None:
     class LLM(MockLLM):
-        def pick(self, last: str) -> str:
-            if "CHECKPOINT UPDATE" in last:
-                return json.dumps({
-                    "thought": "inspecting the result",
-                    "actions": [{"kind": "end_turn"}],
-                })
-            return json.dumps({
-                "thought": "play once, then inspect",
-                "actions": [{
-                    "kind": "play", "card_ref": "h0", "target_ref": "e0",
-                    "checkpoint_after": True,
-                }],
-            })
+        script = [CHUNK_STRIKE_INSPECT, CHUNK_END_TURN]
 
     s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
     s1 = combat_state("r1", energy=2, hand=[], enemies=[cultist(34)],
                       discard_count=1)
 
     s, bridge = run_agent(9124, LLM, states=[s0, s1])
-    wait_until(lambda: len(bridge.actions) >= 2 or not s.status()["running"])
+    wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
 
     assert len(bridge.actions) == 2, bridge.actions
-    assert st["model_call_count"] == 2, st  # stopped after ONE action
+    assert st["llm_request_count"] == 2, st  # stopped after ONE action
     assert st["last_checkpoint_reason"] == "MODEL_REQUESTED", st
+    assert st["game_action_sent_count"] == 2, st
+    assert st["game_action_confirmed_count"] == 1, st
     print("PASS TEST 9 explicit_checkpoint")
 
 
 # ----------------------------------------------------------------
-# TEST 10 — strict failure: no fallback, benchmark invalid
+# TEST 6 — strict failure: no fallback, request accounting
 # ----------------------------------------------------------------
 
 def test_strict_failure() -> None:
     class LLM(MockLLM):
-        def __init__(self, *a, **k):
-            super().__init__(*a, **k)
-            self.fail = True
+        fail = True
 
     s0 = combat_state("r0", energy=3,
                       hand=[card("STRIKE", target="AnyEnemy"), card("DEFEND")])
@@ -368,13 +508,20 @@ def test_strict_failure() -> None:
     assert st["benchmark_valid"] is False, st
     assert "LLM API error" in st["invalidation_reason"], st
     assert st["fallback_action_count"] == 0, st
-    print("PASS TEST 10 strict_failure")
+    # The failed inference attempt IS counted (FIX: request accounting).
+    assert st["llm_request_count"] == 1, st
+    assert st["llm_failed_request_count"] == 1, st
+    assert st["llm_success_count"] == 0, st
+    assert st["game_action_sent_count"] == 0, st
+    print("PASS TEST 6 strict_failure")
 
 
 def run_all() -> None:
     tests = [
-        test_one_call_multiple_actions,
-        test_draw_causes_checkpoint,
+        test_one_plan_three_confirmed_actions,
+        test_draw_checkpoint_reprompt_contains_full_new_card_information,
+        test_screen_change_reconciles_inflight_before_routing,
+        test_lethal_action_reward_screen_plan_completed,
         test_rejected_action_no_replay,
         test_explicit_checkpoint,
         test_strict_failure,

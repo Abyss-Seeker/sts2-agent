@@ -27,8 +27,9 @@
   "decision_mode": "single_action",
   "failure_policy": "benchmark_strict",
   "action_chunk_max_actions": 16,
-  "delta_observations": true,
+  "delta_observations": false,
   "thinking_enabled": true,
   "reasoning_effort": "high",
-  "stream_mode": "off"
+  "stream_mode": "off",
+  "provider_profile": "auto"
 }

@@ -24,6 +24,26 @@ class BenchmarkMetrics:
     invalid_action_count: int = 0
     fallback_action_count: int = 0
 
+    # ---- Granular accounting (review remediation) ------------------
+    # A game action is SENT when handed to the bridge; it is CONFIRMED
+    # only by the next authoritative state (the visible world moved
+    # forward -- screen changes / new turns / terminal all count), or
+    # REJECTED when the bridge re-emits an action-relevantly unchanged
+    # state. game_action_count stays as the CONFIRMED alias.
+    game_action_sent_count: int = 0
+    game_action_confirmed_count: int = 0
+    game_action_rejected_count: int = 0
+
+    # logical_inspection_count: cognitive boundaries (model inspect
+    # requests). llm_request_count: EVERY real llm.chat() / HTTP
+    # inference attempt, including failures and retries.
+    # One inspection may issue several requests (JSON/timeout retries):
+    #   logical_inspection_count <= llm_request_count.
+    logical_inspection_count: int = 0
+    llm_request_count: int = 0
+    llm_success_count: int = 0
+    llm_failed_request_count: int = 0
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
     reasoning_tokens: int = 0
@@ -43,7 +63,17 @@ class BenchmarkMetrics:
             self.invalidation_reason = reason
         self.benchmark_valid = False
 
-    def record_model_call(
+    def record_inspection(self) -> None:
+        """One cognitive boundary / model inspect request."""
+        self.logical_inspection_count += 1
+        self.model_inspection_count += 1
+
+    def record_llm_request(self) -> None:
+        """EVERY real llm.chat() / HTTP inference attempt (call BEFORE
+        the request so failures and retries are counted too)."""
+        self.llm_request_count += 1
+
+    def record_llm_success(
         self,
         *,
         latency_ms: int | None = None,
@@ -51,8 +81,7 @@ class BenchmarkMetrics:
         first_content_ms: int | None = None,
         usage: dict[str, Any] | None = None,
     ) -> None:
-        self.model_call_count += 1
-        self.model_inspection_count += 1
+        self.llm_success_count += 1
         if latency_ms is not None:
             self.llm_latencies_ms.append(int(latency_ms))
         if first_reasoning_ms is not None:
@@ -62,12 +91,52 @@ class BenchmarkMetrics:
         if usage:
             self._add_usage(usage)
 
+    def record_llm_failure(self) -> None:
+        """One failed inference attempt (timeout / HTTP error / abandoned)."""
+        self.llm_failed_request_count += 1
+
+    def record_model_call(
+        self,
+        *,
+        latency_ms: int | None = None,
+        first_reasoning_ms: int | None = None,
+        first_content_ms: int | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> None:
+        """Legacy helper: one successful model call (request + success).
+        Kept for the standalone core runtime tests; agent code uses the
+        granular request/success/failure API."""
+        self.model_call_count += 1
+        self.record_llm_request()
+        self.record_llm_success(
+            latency_ms=latency_ms,
+            first_reasoning_ms=first_reasoning_ms,
+            first_content_ms=first_content_ms,
+            usage=usage,
+        )
+
     def record_plan(self, action_count: int) -> None:
         self.strategic_plan_count += 1
         self.planned_actions_total += max(0, int(action_count))
 
+    def record_action_sent(self, *, from_plan: bool = True) -> None:
+        """Handed to the bridge -- NOT yet confirmed."""
+        self.game_action_sent_count += 1
+        if from_plan:
+            self.executed_planned_actions_total += 1
+
+    def record_action_confirmed(self) -> None:
+        """Confirmed by the next authoritative bridge state."""
+        self.game_action_confirmed_count += 1
+        self.game_action_count += 1  # compat alias: game_action_count = CONFIRMED
+
+    def record_action_rejected(self) -> None:
+        """Bridge re-emitted an action-relevantly unchanged state."""
+        self.game_action_rejected_count += 1
+
     def record_game_action(self, *, from_plan: bool = True) -> None:
-        self.game_action_count += 1
+        """Legacy alias: record a CONFIRMED game action."""
+        self.record_action_confirmed()
         if from_plan:
             self.executed_planned_actions_total += 1
 
@@ -135,17 +204,31 @@ class BenchmarkMetrics:
             "invalidation_reason": self.invalidation_reason,
             "model_call_count": self.model_call_count,
             "strategic_plan_count": self.strategic_plan_count,
-            "game_action_count": self.game_action_count,
+            "game_action_count": self.game_action_count,  # CONFIRMED alias
+            "game_action_sent_count": self.game_action_sent_count,
+            "game_action_confirmed_count": self.game_action_confirmed_count,
+            "game_action_rejected_count": self.game_action_rejected_count,
             "model_inspection_count": self.model_inspection_count,
+            "logical_inspection_count": self.logical_inspection_count,
+            "llm_request_count": self.llm_request_count,
+            "llm_success_count": self.llm_success_count,
+            "llm_failed_request_count": self.llm_failed_request_count,
             "checkpoint_count": self.checkpoint_count,
             "plan_completed_count": self.plan_completed_count,
             "plan_interrupted_count": self.plan_interrupted_count,
             "invalid_plan_count": self.invalid_plan_count,
             "invalid_action_count": self.invalid_action_count,
             "fallback_action_count": self.fallback_action_count,
+            # Denominator is EVERY inference attempt (incl. failed/retried),
+            # so the KPI cannot be flattered by silent failures.
             "actions_per_llm_call": (
-                self.game_action_count / self.model_call_count
-                if self.model_call_count
+                self.game_action_confirmed_count / self.llm_request_count
+                if self.llm_request_count
+                else 0.0
+            ),
+            "actions_per_logical_inspection": (
+                self.game_action_confirmed_count / self.logical_inspection_count
+                if self.logical_inspection_count
                 else 0.0
             ),
             "plan_completion_ratio": (

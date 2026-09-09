@@ -14,9 +14,10 @@ import urllib.error
 import urllib.request
 
 from deepseek_provider_reference import (
+    DEEPSEEK_CAPABILITIES,
+    GENERIC_CAPABILITIES,
     StreamAccumulator,
     build_chat_payload,
-    detect_capabilities,
     parse_sse_data_lines,
 )
 
@@ -65,6 +66,7 @@ class LLMClient:
         thinking_enabled: bool | None = None,
         reasoning_effort: str | None = None,
         stream_mode: str = "off",
+        provider_profile: str = "auto",
     ):
         self.base_url = (base_url or "").rstrip("/")
         if self.base_url.endswith("/chat/completions"):
@@ -92,17 +94,35 @@ class LLMClient:
         # (relay bug vs. model output). One JSON line per call.
         self.raw_dump_path = raw_dump_path
         # ---- Provider capability support (beta) --------------------
-        # DeepSeek official endpoints get thinking/reasoning_effort
-        # fields; generic OpenAI-compatible relays keep the old plain
-        # payload. Streaming stays OFF by default: some relays corrupt
-        # streamed content (observed with a webai2api-style relay).
-        self.caps = detect_capabilities(base_url, model)
+        # provider_profile:
+        #   "auto"    (default) native DeepSeek fields ONLY when the
+        #             HOSTNAME is api.deepseek.com -- never inferred from
+        #             the model name (a relay serving "deepseek-v4-pro"
+        #             is still a generic OpenAI-compatible endpoint).
+        #   "generic" always plain OpenAI-compatible payload.
+        #   "deepseek" user explicitly forces the native DeepSeek profile.
+        profile = (provider_profile or "auto").lower()
+        if profile == "generic":
+            self.caps = GENERIC_CAPABILITIES
+        elif profile == "deepseek":
+            self.caps = DEEPSEEK_CAPABILITIES
+        else:  # auto: hostname check ONLY, never the model name.
+            self.caps = (
+                DEEPSEEK_CAPABILITIES
+                if "api.deepseek.com" in (base_url or "").lower()
+                else GENERIC_CAPABILITIES
+            )
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
         self.stream_mode = (stream_mode or "off").lower()
         # Optional live-delta callbacks (UI streaming display).
         self.on_reasoning_delta = None  # callable(str)
         self.on_content_delta = None    # callable(str)
+        # First-token latency (FIX: measured once per call, at the FIRST
+        # callback delta, relative to the real call-start monotonic ts).
+        self._call_start: float = 0.0
+        self.first_reasoning_ms: int | None = None
+        self.first_content_ms: int | None = None
 
     def _should_stream(self) -> bool:
         if self.stream_mode == "on":
@@ -163,6 +183,11 @@ class LLMClient:
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         """Send a chat completion request; returns the assistant text."""
+        # First-token latency baseline: one monotonic ts per call; the
+        # first streaming delta writes it ONCE (never rewritten per token).
+        self._call_start = time.monotonic()
+        self.first_reasoning_ms = None
+        self.first_content_ms = None
         use_stream = self._should_stream()
         payload = build_chat_payload(
             model=self.model,
@@ -237,16 +262,28 @@ class LLMClient:
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             for event in parse_sse_data_lines(resp):
                 r_delta, c_delta = acc.feed_event(event)
-                if r_delta and self.on_reasoning_delta is not None:
-                    try:
-                        self.on_reasoning_delta(r_delta)
-                    except Exception:
-                        pass
-                if c_delta and self.on_content_delta is not None:
-                    try:
-                        self.on_content_delta(c_delta)
-                    except Exception:
-                        pass
+                if r_delta:
+                    # Write the first-token timestamp ONCE, based on the
+                    # real call-start monotonic timestamp.
+                    if self.first_reasoning_ms is None:
+                        self.first_reasoning_ms = int(
+                            (time.monotonic() - self._call_start) * 1000
+                        )
+                    if self.on_reasoning_delta is not None:
+                        try:
+                            self.on_reasoning_delta(r_delta)
+                        except Exception:
+                            pass
+                if c_delta:
+                    if self.first_content_ms is None:
+                        self.first_content_ms = int(
+                            (time.monotonic() - self._call_start) * 1000
+                        )
+                    if self.on_content_delta is not None:
+                        try:
+                            self.on_content_delta(c_delta)
+                        except Exception:
+                            pass
         self.last_reasoning = acc.reasoning
         self.last_finish_reason = acc.finish_reason
         if isinstance(acc.usage, dict):
