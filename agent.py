@@ -642,8 +642,11 @@ class AgentSession:
                 **DEFAULT_CONFIG,
                 **migrate_reasoning_config(migrated_prompts),
             }
-            for w in prompt_warnings:
-                self._log("warning", w)
+            # NOTE: prompt_warnings MUST NOT be logged here -- _log takes
+            # self._lock and this whole block already holds it (a plain,
+            # non-reentrant Lock): logging inside would deadlock start()
+            # forever (observed: runner hangs before its first log line).
+            # They are logged right after the lock is released below.
             # Normalize beta knobs to their allowed values.
             if self._config.get("decision_mode") not in ("single_action", "action_chunk"):
                 self._config["decision_mode"] = "single_action"
