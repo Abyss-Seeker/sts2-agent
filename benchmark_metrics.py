@@ -46,6 +46,28 @@ class BenchmarkMetrics:
     llm_success_count: int = 0
     llm_failed_request_count: int = 0
 
+    # ---- Combat-only layer (ActionChunk optimizes combat cognition) ----
+    # Same semantics as the session-level counters, restricted to
+    # combat_action decisions / chunk plan actions.
+    combat_llm_request_count: int = 0
+    combat_llm_success_count: int = 0
+    combat_logical_inspection_count: int = 0
+    combat_game_action_sent_count: int = 0
+    combat_game_action_confirmed_count: int = 0
+    combat_turn_count: int = 0
+    combat_llm_latencies_ms: list[int] = field(default_factory=list)
+    combat_prompt_tokens: int = 0
+    combat_completion_tokens: int = 0
+    combat_reasoning_tokens: int = 0
+
+    # ---- Continuity / recovery accounting (session-level aggregates) ----
+    recoverable_termination_count: int = 0
+    bridge_reconnect_count: int = 0
+    game_relaunch_count: int = 0
+    safe_recovery_count: int = 0
+    strategic_recovery_count: int = 0
+    transport_interrupted_action_count: int = 0
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
     reasoning_tokens: int = 0
@@ -65,15 +87,19 @@ class BenchmarkMetrics:
             self.invalidation_reason = reason
         self.benchmark_valid = False
 
-    def record_inspection(self) -> None:
+    def record_inspection(self, *, combat: bool = False) -> None:
         """One cognitive boundary / model inspect request."""
         self.logical_inspection_count += 1
         self.model_inspection_count += 1
+        if combat:
+            self.combat_logical_inspection_count += 1
 
-    def record_llm_request(self) -> None:
+    def record_llm_request(self, *, combat: bool = False) -> None:
         """EVERY real llm.chat() / HTTP inference attempt (call BEFORE
         the request so failures and retries are counted too)."""
         self.llm_request_count += 1
+        if combat:
+            self.combat_llm_request_count += 1
 
     def record_llm_success(
         self,
@@ -82,6 +108,7 @@ class BenchmarkMetrics:
         first_reasoning_ms: int | None = None,
         first_content_ms: int | None = None,
         usage: dict[str, Any] | None = None,
+        combat: bool = False,
     ) -> None:
         self.llm_success_count += 1
         if latency_ms is not None:
@@ -92,6 +119,32 @@ class BenchmarkMetrics:
             self.first_content_token_ms.append(int(first_content_ms))
         if usage:
             self._add_usage(usage)
+        if combat:
+            self.combat_llm_success_count += 1
+            if latency_ms is not None:
+                self.combat_llm_latencies_ms.append(int(latency_ms))
+            if usage:
+                try:
+                    self.combat_prompt_tokens += int(usage.get("prompt_tokens") or 0)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    self.combat_completion_tokens += int(
+                        usage.get("completion_tokens") or 0)
+                except (TypeError, ValueError):
+                    pass
+                details = usage.get("completion_tokens_details")
+                reasoning = int(
+                    usage.get("reasoning_tokens") or 0)
+                if isinstance(details, dict):
+                    try:
+                        reasoning += int(details.get("reasoning_tokens") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    self.combat_reasoning_tokens += reasoning
+                except (TypeError, ValueError):
+                    pass
 
     def record_llm_failure(self) -> None:
         """One failed inference attempt (timeout / HTTP error / abandoned)."""
@@ -126,18 +179,24 @@ class BenchmarkMetrics:
         self.strategic_plan_count += 1
         self.planned_actions_total += max(0, int(action_count))
 
-    def record_action_sent(self, *, from_plan: bool = True) -> None:
+    def record_action_sent(self, *, from_plan: bool = True, combat: bool = False) -> None:
         """Handed to the bridge -- NOT yet confirmed. Does NOT touch
         executed_planned_actions_total: only CONFIRMED plan actions count
         as executed."""
         self.game_action_sent_count += 1
+        if combat:
+            self.combat_game_action_sent_count += 1
 
-    def record_action_confirmed(self, *, from_plan: bool = False) -> None:
+    def record_action_confirmed(
+        self, *, from_plan: bool = False, combat: bool = False
+    ) -> None:
         """Confirmed by the next authoritative bridge state."""
         self.game_action_confirmed_count += 1
         self.game_action_count += 1  # compat alias: game_action_count = CONFIRMED
         if from_plan:
             self.executed_planned_actions_total += 1
+        if combat:
+            self.combat_game_action_confirmed_count += 1
 
     def record_action_rejected(self) -> None:
         """Bridge re-emitted an action-relevantly unchanged state."""
@@ -151,6 +210,35 @@ class BenchmarkMetrics:
     def record_game_action(self, *, from_plan: bool = True) -> None:
         """Legacy alias: record a CONFIRMED game action."""
         self.record_action_confirmed(from_plan=from_plan)
+
+    # ---- Continuity / recovery accounting ----
+
+    def record_transport_interrupted(self) -> None:
+        """A plan step could not even be handed to the bridge (transport
+        failure): NOT sent, NOT confirmed, NOT executed."""
+        self.transport_interrupted_action_count += 1
+
+    def record_recoverable_termination(self) -> None:
+        self.recoverable_termination_count += 1
+
+    def record_bridge_reconnect(self) -> None:
+        self.bridge_reconnect_count += 1
+
+    def record_game_relaunch(self) -> None:
+        self.game_relaunch_count += 1
+
+    def record_safe_recovery(self) -> None:
+        """A recovery that made NO strategic decision on the agent's
+        behalf (reconnect / re-observe / re-enter bridge handler)."""
+        self.safe_recovery_count += 1
+
+    def record_strategic_recovery(self) -> None:
+        """A non-LLM decision was made during recovery -- invalidates the
+        benchmark (set by the caller via invalidate())."""
+        self.strategic_recovery_count += 1
+
+    def record_combat_turn(self) -> None:
+        self.combat_turn_count += 1
 
     def record_checkpoint(self, reason: str, *, interrupted: bool = True) -> None:
         self.checkpoint_count += 1
@@ -232,6 +320,40 @@ class BenchmarkMetrics:
             "invalid_plan_count": self.invalid_plan_count,
             "invalid_action_count": self.invalid_action_count,
             "fallback_action_count": self.fallback_action_count,
+            # HTTP-attempt layer alias (identical value; clearer name for
+            # the "every real urlopen" accounting level).
+            "http_attempt_count": self.llm_request_count,
+            # Combat-only layer (X): ActionChunk targets combat cognition.
+            "combat_llm_request_count": self.combat_llm_request_count,
+            "combat_llm_success_count": self.combat_llm_success_count,
+            "combat_logical_inspection_count": self.combat_logical_inspection_count,
+            "combat_game_action_sent_count": self.combat_game_action_sent_count,
+            "combat_game_action_confirmed_count": self.combat_game_action_confirmed_count,
+            "combat_actions_per_llm_call": (
+                self.combat_game_action_confirmed_count
+                / self.combat_llm_request_count
+                if self.combat_llm_request_count else 0.0
+            ),
+            "combat_actions_per_logical_inspection": (
+                self.combat_game_action_confirmed_count
+                / self.combat_logical_inspection_count
+                if self.combat_logical_inspection_count else 0.0
+            ),
+            "combat_llm_latency_ms_p50": self._percentile(
+                self.combat_llm_latencies_ms, 0.50),
+            "combat_llm_latency_ms_p95": self._percentile(
+                self.combat_llm_latencies_ms, 0.95),
+            "combat_prompt_tokens": self.combat_prompt_tokens,
+            "combat_completion_tokens": self.combat_completion_tokens,
+            "combat_reasoning_tokens": self.combat_reasoning_tokens,
+            "combat_turn_count": self.combat_turn_count,
+            # Continuity / recovery (S)
+            "recoverable_termination_count": self.recoverable_termination_count,
+            "bridge_reconnect_count": self.bridge_reconnect_count,
+            "game_relaunch_count": self.game_relaunch_count,
+            "safe_recovery_count": self.safe_recovery_count,
+            "strategic_recovery_count": self.strategic_recovery_count,
+            "transport_interrupted_action_count": self.transport_interrupted_action_count,
             # Denominator is EVERY inference attempt (incl. failed/retried),
             # so the KPI cannot be flattered by silent failures.
             "actions_per_llm_call": (

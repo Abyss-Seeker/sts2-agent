@@ -123,6 +123,7 @@ s = AgentSession()
 s.start({
     "bridge_host": "127.0.0.1", "bridge_port": FAKE_PORT,
     "save_log": False, "disable_fallback": True,
+    "auto_resume": False,  # this test asserts the agent STOPS at run end
     "api_base_url": "http://mock", "api_key": "x", "model": "mock",
 })
 deadline = time.time() + 15

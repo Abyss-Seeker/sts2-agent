@@ -206,6 +206,7 @@ def run_agent(port: int, llm_cls, cfg: dict | None = None,
         "bridge_host": "127.0.0.1", "bridge_port": port,
         "save_log": False, "disable_fallback": True,
         "auto_launch_game": False, "dump_raw_responses": False,
+        "auto_resume": False,  # tests assert termination, not recovery waits
         "api_base_url": "http://mock", "api_key": "x", "model": "mock",
         "decision_mode": "action_chunk",
         **(cfg or {}),

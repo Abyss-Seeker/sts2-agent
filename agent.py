@@ -14,6 +14,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from typing import Any
 
@@ -480,6 +481,13 @@ class AgentSession:
         self._log_file = None
         self._llm_fail_streak = 0
         self._llm: LLMClient | None = None
+        # True while an LLM HTTP inference is running in its worker thread
+        # (runner-facing "safe_to_disconnect" input).
+        self._llm_inflight = 0
+        # Run identity: same save resumed after a recoverable termination
+        # keeps the same run_id; a finished run (victory/defeat) starts a
+        # new one. Session-level metrics span all runs.
+        self._run_id = ""
         # (hand signature, card_index) of the last combat fallback, used to
         # avoid retrying a card the game refused.
         self._fallback_attempt: tuple[tuple[tuple[str, bool], ...], int] | None = None
@@ -550,6 +558,8 @@ class AgentSession:
                 self._config["provider_profile"] = "auto"
             self._stop.clear()
             self._running = True
+            self._llm_inflight = 0
+            self._run_id = uuid.uuid4().hex[:12]
             self._last_error = ""
             self._decision_count = 0
             self._llm_fail_streak = 0
@@ -608,6 +618,25 @@ class AgentSession:
                 "max_hp": self._memory.max_hp,
                 "gold": self._memory.gold,
                 "log_seq": self._log_seq,
+                # V: explicit safe-to-disconnect signal for runners --
+                # no active HTTP inference, no chunk action inflight, no
+                # pending single-action confirmation.
+                "safe_to_disconnect": (
+                    not self._running
+                    or (
+                        self._llm_inflight == 0
+                        and self._plan_executor.inflight is None
+                        and self._pending_single_action is None
+                        and self._agent_phase not in ("thinking",)
+                    )
+                ),
+                "run_id": self._run_id,
+                "recoverable_termination_count": self._metrics.recoverable_termination_count,
+                "bridge_reconnect_count": self._metrics.bridge_reconnect_count,
+                "game_relaunch_count": self._metrics.game_relaunch_count,
+                "safe_recovery_count": self._metrics.safe_recovery_count,
+                "strategic_recovery_count": self._metrics.strategic_recovery_count,
+                "transport_interrupted_action_count": self._metrics.transport_interrupted_action_count,
                 # LLM usage / model info for the overlay display.
                 "model": str(self._config.get("model", "") or ""),
                 "llm_prompt_tokens": prompt_tokens,
@@ -638,6 +667,27 @@ class AgentSession:
                     / self._metrics.planned_actions_total
                     if self._metrics.planned_actions_total else 0.0
                 ),
+                # Combat-only layer (X)
+                "combat_llm_request_count": self._metrics.combat_llm_request_count,
+                "combat_game_action_confirmed_count": self._metrics.combat_game_action_confirmed_count,
+                "combat_actions_per_llm_call": (
+                    self._metrics.combat_game_action_confirmed_count
+                    / self._metrics.combat_llm_request_count
+                    if self._metrics.combat_llm_request_count else 0.0
+                ),
+                "combat_actions_per_logical_inspection": (
+                    self._metrics.combat_game_action_confirmed_count
+                    / self._metrics.combat_logical_inspection_count
+                    if self._metrics.combat_logical_inspection_count else 0.0
+                ),
+                "combat_turn_count": self._metrics.combat_turn_count,
+                "combat_llm_latency_ms_p50": self._metrics._percentile(
+                    self._metrics.combat_llm_latencies_ms, 0.50),
+                "combat_llm_latency_ms_p95": self._metrics._percentile(
+                    self._metrics.combat_llm_latencies_ms, 0.95),
+                "combat_prompt_tokens": self._metrics.combat_prompt_tokens,
+                "combat_completion_tokens": self._metrics.combat_completion_tokens,
+                "combat_reasoning_tokens": self._metrics.combat_reasoning_tokens,
                 "checkpoint_count": self._metrics.checkpoint_count,
                 "plan_completed_count": self._metrics.plan_completed_count,
                 "plan_interrupted_count": self._metrics.plan_interrupted_count,
@@ -900,21 +950,43 @@ class AgentSession:
                     self._plan_executor.reset()
                     self._agent_phase = "terminal"
                     # Diagnostics: record WHICH terminal state arrived and
-                    # its result (victory vs terminated) -- a terminal right
-                    # after a confirmed non-combat action points at the
-                    # mod's run-finalization path, not the agent.
+                    # its result -- a terminal right after a confirmed
+                    # non-combat action points at the mod's run-finalization
+                    # path, not the agent.
                     self._log(
                         "state",
                         f"收到终止状态: {stype}"
                         f" (result={state.get('result', '?')},"
                         f" floor={state.get('floor', '?')})",
                     )
-                    self._log("info", "Run finished; agent stopping.")
-                    # AUTO-RESUME: the run's save is kept, so wait for the
-                    # game to come back instead of tearing the session down.
-                    # The mod resumes the saved run on its own (it clicks
-                    # "Continue" on the main menu).
-                    if not self._maybe_resume():
+                    kind = self._classify_terminal(state)
+                    if kind in ("NORMAL_VICTORY", "NORMAL_DEFEAT"):
+                        self._log(
+                            "info",
+                            f"Run finished ({kind}); finalizing this run and"
+                            " waiting for the next one.",
+                        )
+                    else:
+                        self._log(
+                            "info",
+                            f"Recoverable interruption ({kind}); the same"
+                            " save will be resumed with its run context"
+                            " preserved.",
+                        )
+                    # Per-run report slice for the continuous runner
+                    # (developer/benchmark artifact, never an LLM prompt).
+                    self._log(
+                        "run_report",
+                        f"{kind} at floor {state.get('floor', '?')}",
+                        run_id=self._run_id,
+                        result=kind,
+                        snapshot=self._metrics.snapshot(),
+                    )
+                    if kind in ("NORMAL_VICTORY", "NORMAL_DEFEAT"):
+                        resume_ok = self._maybe_resume(same_run=False)
+                    else:
+                        resume_ok = self._recover_interrupted_run(state)
+                    if not resume_ok:
                         break
                     continue
                 try:
@@ -962,24 +1034,121 @@ class AgentSession:
             except Exception:
                 pass
 
-    def _maybe_resume(self) -> bool:
-        """After a terminated run, wait for the game and resume the save.
+    def _classify_terminal(self, state: dict[str, Any]) -> str:
+        """Classify a terminal state (routing + diagnostics).
 
-        An aborted run keeps its save: the next time the game reaches the main
-        menu the mod clicks "Continue" and picks the run back up by itself. So
-        instead of tearing the session down (and losing all context), wait for
-        the bridge to come back and keep playing.
+        NORMAL_VICTORY / NORMAL_DEFEAT: the run genuinely ended -- a
+        continuous runner finalizes this run and starts a new one.
+        RECOVERABLE_INTERRUPTION (result=terminated): the save still
+        exists; resume the SAME run with its context preserved.
+        """
+        stype = str(state.get("type", ""))
+        result = str(state.get("result", "")).lower()
+        if stype == BridgeStateType.RUN_COMPLETE and result != "terminated":
+            return "NORMAL_VICTORY"
+        if stype == BridgeStateType.GAME_OVER and result != "terminated":
+            return "NORMAL_DEFEAT"
+        return "RECOVERABLE_INTERRUPTION"
 
-        Returns True when the bridge was re-established (caller should continue
-        its loop), False to stop the agent.
+    def _recover_interrupted_run(self, state: dict[str, Any]) -> bool:
+        """Recover a RECOVERABLE_INTERRUPTION: same save, SAME run_id,
+        RunMemory / LLM history / benchmark counters preserved, stale
+        transport state cleared, bounded Steam relaunch + bridge
+        reconnect, bridge settings re-applied. Never invents the current
+        game phase -- the next authoritative state decides everything.
+        """
+        self._metrics.record_recoverable_termination()
+        return self._maybe_resume(same_run=True)
+
+    def _clear_stale_transport_state(self) -> None:
+        """Drop ALL in-flight transport/plan state before a reconnect.
+
+        Stale inflight actions can never be safely confirmed across a
+        bridge restart: they are NOT counted as confirmed or rejected.
+        """
+        executor = self._plan_executor
+        if executor.inflight is not None:
+            self._metrics.record_transport_interrupted()
+            self._log(
+                "warning",
+                "INTERRUPTED_UNCONFIRMED_ACTION: an in-flight plan action"
+                " was never confirmed (not counted as confirmed/rejected).",
+            )
+        if self._pending_single_action is not None:
+            self._metrics.record_transport_interrupted()
+            self._log(
+                "warning",
+                "INTERRUPTED_UNCONFIRMED_ACTION: a pending single-action"
+                " confirmation was dropped (not counted as"
+                " confirmed/rejected).",
+            )
+        executor.reset()
+        self._pending_single_action = None
+        self._pending_single_before_state = None
+        self._plan_executed = []
+        self._current_plan_id = ""
+        self._current_plan_step = 0
+        self._current_plan_total = 0
+        self._current_plan_thought = ""
+        self._plan_state_text = ""
+        with self._lock:
+            self._live_reasoning = ""
+            self._live_content = ""
+        self._last_model_observation_state = None
+        self._last_model_observation_text = ""
+
+    def _finalize_run_context(self) -> None:
+        """Finalize the current run (victory/defeat): fresh run-level
+        context and a NEW run_id. Session-level metrics/aggregates
+        (BenchmarkMetrics, logs) deliberately continue across runs."""
+        self._memory = RunMemory()
+        self._ctx = ContextManager(
+            config=ContextConfig(
+                max_history_turns=int(self._config["max_history_turns"]),
+                max_state_chars=int(self._config["max_state_chars"]),
+                max_context_chars=int(self._config["max_context_chars"]),
+            )
+        )
+        self._run_id = uuid.uuid4().hex[:12]
+        self._log("info", f"新 run 开始 (run_id={self._run_id})。")
+
+    def _maybe_resume(self, *, same_run: bool = True) -> bool:
+        """Continue a session after a run ended.
+
+        same_run=True (recoverable termination): preserve RunMemory, LLM
+        history and benchmark counters -- the SAME save is being resumed.
+
+        same_run=False (victory/defeat): finalize the run context; the
+        next run starts fresh (new run_id, fresh run memory/context) while
+        session-level metrics continue to aggregate.
+
+        Recovery is SAFE state recovery only: process check, bounded Steam
+        relaunch, bridge reconnect, re-apply bridge settings. It never
+        invents the current game phase -- the next authoritative state
+        decides everything.
+
+        Returns True when the bridge was re-established (caller should
+        continue its loop), False to stop the agent.
         """
         if not self._config.get("auto_resume", True):
             return False
 
+        if same_run:
+            self._metrics.record_safe_recovery()
+        self._clear_stale_transport_state()
+
+        if not same_run:
+            self._finalize_run_context()
+        else:
+            self._log(
+                "info",
+                f"同一存档恢复（run_id={self._run_id}）：运行记忆/LLM 历史/"
+                "benchmark 计数全部保留。",
+            )
+
         self._log(
             "info",
-            "存档已保留：下次进入主菜单时 mod 会自动点“继续”接着上次进度。"
-            "正在等待游戏重连（可随时点“停止”中断）…",
+            "正在等待游戏与桥接恢复（可随时点“停止”中断）…",
         )
         try:
             wait_s = float(self._config.get("resume_wait_seconds", 600) or 600)
@@ -988,7 +1157,40 @@ class AgentSession:
         deadline = time.monotonic() + max(30.0, wait_s)
 
         self._bridge_connected = False
+        relaunched = False
+        launch_attempts = 0
         while not self._stop.is_set() and time.monotonic() < deadline:
+            # G: if the game process disappeared, relaunch it (bounded).
+            game_on = True
+            try:
+                from game_launcher import is_game_running
+
+                game_on = is_game_running()
+            except Exception:
+                game_on = True  # assume running when detection fails
+            if not game_on and not relaunched:
+                launch_attempts += 1
+                if launch_attempts > 3:
+                    self._log("error", "游戏重拉次数超过上限（3 次），停止恢复。")
+                    return False
+                try:
+                    from game_launcher import launch_via_steam
+
+                    self._log(
+                        "info",
+                        "检测到游戏进程已退出，正在通过 Steam 重新拉起…",
+                    )
+                    self._metrics.record_game_relaunch()
+                    launch_via_steam(
+                        str(self._config.get("steam_appid", "2868840")),
+                        log=lambda m: self._log("info", m),
+                    )
+                    relaunched = True
+                except Exception as e:
+                    self._log("error", f"Steam 重拉失败: {e}")
+            elif game_on:
+                relaunched = False
+
             try:
                 if self._client is not None:
                     try:
@@ -1008,7 +1210,8 @@ class AgentSession:
                 continue
 
             self._bridge_connected = True
-            self._log("info", "已重新连接游戏桥接，继续上次存档。")
+            self._metrics.record_bridge_reconnect()
+            self._log("info", "已重新连接游戏桥接。")
             # Re-apply the settings the resumed run needs.
             try:
                 if self._config.get("disable_fallback", True):
@@ -1021,6 +1224,7 @@ class AgentSession:
                 self._client.set_agent_timeout(agent_timeout)
             except Exception:
                 pass
+            self._metrics.record_safe_recovery()
             return True
 
         if self._stop.is_set():
@@ -1146,7 +1350,7 @@ class AgentSession:
         ):
             self._metrics.record_action_rejected()
         else:
-            self._metrics.record_action_confirmed(from_plan=True)
+            self._metrics.record_action_confirmed(from_plan=True, combat=True)
         self._consume_executor_event(event, state)
         return event
 
@@ -1204,7 +1408,7 @@ class AgentSession:
         # -- that is the entire performance win.
         self._agent_phase = "thinking"
         # One cognitive boundary per state that needs the model.
-        self._metrics.record_inspection()
+        self._metrics.record_inspection(combat=True)
         decision_deadline = time.monotonic() + hard_deadline
         try:
             attempts = max(1, int(self._config.get("decision_attempts", 3)))
@@ -1367,6 +1571,7 @@ class AgentSession:
                 first_reasoning_ms=getattr(llm, "first_reasoning_ms", None),
                 first_content_ms=getattr(llm, "first_content_ms", None),
                 usage=getattr(llm, "last_usage", None) or None,
+                combat=True,
             )
             try:
                 parsed = extract_json(raw_reply)
@@ -1453,12 +1658,33 @@ class AgentSession:
     def _send_prepared_plan_step(
         self, prepared: Any, state: dict[str, Any]
     ) -> None:
-        """Mark + send ONE plan step. This only proves ACTION SENT; the
-        CONFIRMED accounting happens in _reconcile_inflight_if_any() when
-        the authoritative next state arrives."""
-        self._plan_executor.mark_sent(prepared, state)
+        """Send ONE plan step. Transport semantics (identical to the
+        single-action path):
+
+          transport send FAILED (ERROR) -> NOT sent, NOT inflight, NOT
+          executed, NOT confirmed; the executor stays on the same step so
+          a re-established bridge can retry the same committed action.
+
+          transport send OK -> record_action_sent + mark_sent; the
+          CONFIRMED accounting happens in _reconcile_inflight_if_any()
+          when the authoritative next state arrives.
+        """
         result = self._execute(prepared.bridge_action)
-        self._metrics.record_action_sent(from_plan=True)
+        if str(result).startswith("ERROR"):
+            # _execute already failed the session on connection loss; the
+            # executor must NOT be marked inflight (no phantom action) and
+            # the step is not counted as sent.
+            self._metrics.record_transport_interrupted()
+            self._log(
+                "error",
+                "TRANSPORT_SEND_FAILED: plan step was NOT sent"
+                f" (plan {prepared.plan_id} step {prepared.step_index})",
+                plan_id=prepared.plan_id,
+                step_index=prepared.step_index,
+            )
+            return
+        self._plan_executor.mark_sent(prepared, state)
+        self._metrics.record_action_sent(from_plan=True, combat=True)
         self._current_plan_step = prepared.step_index + 1
         self._plan_executed.append(prepared.description)
         self._agent_phase = "executing_plan"
@@ -1497,6 +1723,8 @@ class AgentSession:
         executed = list(self._plan_executed)
         self._last_plan_executed = executed
         self._last_checkpoint_reason = reason.value
+        if reason is CheckpointReason.NEW_TURN:
+            self._metrics.record_combat_turn()
         if completed:
             self._metrics.record_plan_complete()
         self._metrics.record_checkpoint(reason.value, interrupted=not completed)
@@ -1615,7 +1843,12 @@ class AgentSession:
                 out.put(llm.chat(messages))
             except BaseException as e:  # propagate to the main thread
                 out.put(e)
+            finally:
+                with self._lock:
+                    self._llm_inflight = max(0, self._llm_inflight - 1)
 
+        with self._lock:
+            self._llm_inflight += 1
         threading.Thread(target=worker, name="llm-call", daemon=True).start()
         try:
             result = out.get(timeout=deadline)
