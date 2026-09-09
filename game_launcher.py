@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 
 GAME_PROCESS_NAME = "SlayTheSpire2.exe"
 STS2_APPID = "2868840"
@@ -95,3 +96,61 @@ def launch_via_steam(app_id: str = STS2_APPID, log=print) -> bool:
     except OSError as e:
         log(f"Steam 启动失败: {e}")
         return False
+
+
+def wait_for_game_gone(timeout: float = 20.0, log=print) -> bool:
+    """Wait until the game process is REALLY gone (§5 idempotency).
+
+    Steam ignores `-applaunch` for an app that is still shutting down, so
+    launching right after a kill silently fails. Returns True when the
+    process has disappeared within the timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not is_game_running():
+            return True
+        time.sleep(1.0)
+    log("等待游戏进程退出超时（Steam 可能忽略此次 -applaunch）。")
+    return is_game_running() is False
+
+
+def ensure_game_running(
+    *,
+    launch_attempts: int = 3,
+    process_timeout: float = 180.0,
+    log=print,
+) -> bool:
+    """Idempotent cold-start (§5/§6/§7): observe, launch at most
+    ``launch_attempts`` times (re-observing before every attempt), and
+    wait bounded for the game process to appear. Emits launch telemetry.
+
+    Returns True once the game process is running. Bridge readiness is
+    the caller's concern (connect retries).
+    """
+    if is_game_running():
+        log("GAME_PROCESS_RUNNING（无需启动）")
+        return True
+
+    steam_alive = find_steam_exe() is not None
+    log(f"GAME_PROCESS_NOT_FOUND; STEAM_PROCESS_FOUND={steam_alive}")
+
+    for attempt in range(1, launch_attempts + 1):
+        # Re-observe before every attempt; never spam the same command.
+        if is_game_running():
+            return True
+        if not wait_for_game_gone(timeout=20.0, log=log):
+            # Still shutting down -- wait and re-observe instead of launching.
+            time.sleep(5.0)
+            continue
+        log(f"STEAM_LAUNCH_REQUESTED (attempt {attempt}/{launch_attempts})")
+        if not launch_via_steam(log=log):
+            time.sleep(5.0)
+            continue
+        deadline = time.monotonic() + process_timeout
+        while time.monotonic() < deadline:
+            if is_game_running():
+                log(f"GAME_PROCESS_STARTED (attempt {attempt})")
+                return True
+            time.sleep(2.0)
+        log(f"GAME_PROCESS_NOT_STARTED after attempt {attempt}（超时）。")
+    return False

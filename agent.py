@@ -76,6 +76,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "disable_fallback": True,
     "save_log": True,
     "auto_launch_game": True,
+    # Native headful experience (§29-§36): keep the game interactive
+    # (BGM/SFX/animation waits) while the agent plays. FastMode is an
+    # independent switch and only accelerates animations.
+    "headful_native_ui": True,
+    "fast_mode": True,
     "steam_appid": "2868840",
     "action_delay": 0.0,
     "show_thinking": "brief",  # full | brief | hidden
@@ -882,18 +887,20 @@ class AgentSession:
                 self._log("info", f"游戏进程检测失败（按已运行处理）: {e}")
                 game_on = True
             if not game_on:
-                from game_launcher import launch_via_steam
+                from game_launcher import ensure_game_running
 
                 self._log(
                     "info",
                     "未检测到游戏进程（SlayTheSpire2.exe），正在通过 Steam 启动；"
                     "mod 会在主菜单自动开一局。",
                 )
-                launch_via_steam(
-                    str(cfg.get("steam_appid", "2868840")),
+                if ensure_game_running(
                     log=lambda m: self._log("info", m),
-                )
-                cold_start = True
+                ):
+                    cold_start = True
+                else:
+                    self._fail("游戏冷启动失败（bounded retries 耗尽）。")
+                    return
         if game_on or not cfg.get("auto_launch_game", True):
             if game_on:
                 self._log(
@@ -940,6 +947,21 @@ class AgentSession:
             self._log("info", f"游戏端每决策等待窗口已设为 {agent_timeout}s。")
         except ConnectionError as e:
             self._fail(f"Lost bridge while setting agent timeout: {e}")
+            return
+
+        # Native headful experience: BGM/SFX/animation waits stay on.
+        try:
+            headful = bool(cfg.get("headful_native_ui", True))
+            self._client.set_headful(headful)
+            fast = bool(cfg.get("fast_mode", True))
+            self._client.set_fast_mode(fast)
+            self._log(
+                "info",
+                f"Headful={'on' if headful else 'off'} (BGM/SFX/"
+                f"{'on' if headful else 'suppressed'}), FastMode={fast}。",
+            )
+        except ConnectionError as e:
+            self._fail(f"Lost bridge while setting headful mode: {e}")
             return
 
         self._memory = RunMemory()
@@ -1287,17 +1309,18 @@ class AgentSession:
                     self._log("error", "游戏重拉次数超过上限（3 次），停止恢复。")
                     return False
                 try:
-                    from game_launcher import launch_via_steam
+                    from game_launcher import ensure_game_running
 
                     self._log(
                         "info",
                         "检测到游戏进程已退出，正在通过 Steam 重新拉起…",
                     )
                     self._metrics.record_game_relaunch()
-                    launch_via_steam(
-                        str(self._config.get("steam_appid", "2868840")),
+                    if not ensure_game_running(
                         log=lambda m: self._log("info", m),
-                    )
+                    ):
+                        self._log("error", "Steam 重拉失败（本次恢复放弃）。")
+                        return False
                     relaunched = True
                 except Exception as e:
                     self._log("error", f"Steam 重拉失败: {e}")
@@ -1335,6 +1358,13 @@ class AgentSession:
                 agent_timeout = max(
                     10, min(300, int(self._config.get("agent_timeout") or 90)))
                 self._client.set_agent_timeout(agent_timeout)
+            except Exception:
+                pass
+            try:
+                self._client.set_headful(
+                    bool(self._config.get("headful_native_ui", True)))
+                self._client.set_fast_mode(
+                    bool(self._config.get("fast_mode", True)))
             except Exception:
                 pass
             self._metrics.record_safe_recovery()
