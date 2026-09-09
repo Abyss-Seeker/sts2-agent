@@ -40,6 +40,49 @@ server.py + static/     # 本地 Web UI（配置 API/模板、观测决策日志
 4. 游戏内开一局（Agent 会自动接管地图/战斗/商店/事件/奖励等所有决策），
    在 UI 的"决策日志"中实时观察 LLM 的思考与出牌。
 
+## 决策模式（beta）
+
+### `single_action`（基线 / 默认）
+当前最小可用行为：每个状态一次 LLM 调用，每次只执行一个动作。
+
+### `action_chunk`（beta，仅战斗）
+一次模型推理可以提交一组（ActionChunk）**已经由当前可见信息完全确定**的动作：
+模型用"计划作用域引用"（`h0`/`e0`...）规划，harness 在每个动作执行前针对
+**最新权威状态**重新解析引用并校验合法性，再逐个发送；桥接协议保持
+一状态一动作握手不变，改变的只是 LLM 调用频率。
+
+> 核心不变量：**每个动作后都会观测游戏状态，但只在认知边界调用 LLM。**
+> 一次模型推理可以安全地驱动多个逐个被桥接确认的 STS2 动作；
+> harness 负责校验与中断计划，绝不代替模型做策略决策。
+
+计划会在以下**认知边界**被中断并向模型重新询问（全部是协议/信息层规则，
+不含任何策略判断）：新回合、手牌出现新卡（抽牌/生成）、目标死亡/丢失、
+计划引用无法解析、计划动作非法、药水不可用、动作被游戏拒绝（状态无变化）、
+模型显式 `checkpoint_after:true`、屏幕切换。
+
+### benchmark 纯度（`failure_policy`）
+- `benchmark_strict`（默认）：LLM 失败（API 错误/超时/全部解析失败）时
+  **不做任何非 LLM 策略兜底**——标记 benchmark 失效并停止 Agent。
+- `demo_resilient`：允许确定性兜底动作继续演示，但立即记录
+  `NON-LLM FALLBACK USED — benchmark invalidated`，该局结果不作为
+  LLM 成绩。
+
+### 指标
+UI/状态接口区分 **模型调用（model_call_count）** 与 **游戏动作
+（game_action_count）**，并给出 `actions_per_llm_call`、检查点直方图、
+计划完成/中断比、token 与缓存命中、`benchmark_valid` 等（`/api/status`）。
+核心 KPI：`actions_per_llm_call > 1` 且不增加非法动作率、无隐藏信息。
+
+### DeepSeek 能力（可选）
+`thinking_enabled` / `reasoning_effort`（low|high|max）仅在官方 DeepSeek
+端点生效（自动能力探测，不会发给通用 OpenAI 兼容中转）；`stream_mode`
+默认 `off`（部分中转的流式重组会损坏内容），`on`/`auto` 时也只执行
+**完整**回复，绝不解析流式半截 JSON。
+
+### 信息对等（human parity，保持不变）
+模型只能看到真人玩家在当前界面能看到的信息：无抽牌堆顺序、无 RNG、
+无 '?' 房间真实类型、无未来敌人意图细节、无隐藏事件结果。
+
 ## 无游戏基础 LLM 的适配
 
 - **规则书**：系统提示内置一份从零讲起的规则书（能量/格挡/伤害公式/意图/
@@ -74,8 +117,8 @@ LLM API 是无状态的，长局远超窗口，因此每步决策的消息构成
 ## 测试（无游戏也能跑）
 
 ```powershell
-python smoke_test.py
+python smoke_test.py            # 纯逻辑冒烟：JSON 提取/动作校验/格式化
+python e2e_test.py              # 假桥接 + MockLLM 的完整单动作决策回路
+python tests\test_core_runtime.py   # ActionChunk 核心运行时（解析/执行器/检查点）
+python tests\test_beta_e2e.py       # action_chunk 验收：一次调用多动作/抽牌检查点/拒绝/严格失败
 ```
-
-纯逻辑冒烟测试：JSON 提取、动作校验、上下文预算裁剪、战斗/地图状态格式化，
-全部不依赖游戏进程。

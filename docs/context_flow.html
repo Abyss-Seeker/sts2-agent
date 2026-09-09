@@ -125,6 +125,23 @@ sequenceDiagram
 <p class="hint">术语区分：<b>transport_retries</b>（<code>llm_retries</code>，单次 HTTP 调用的传输重试，默认 0）≠ <b>decision_validation_attempts</b>（<code>decision_attempts</code>，同一状态最多 3 次解析/校验尝试，共享同一 deadline）。重试反馈包含：前一个动作、被拒原因、"当前状态未变、以上文本仍然准确"、以及本屏合法 schema 指引。</p>
 </div>
 
+<h2>三½、Beta：ActionChunk 模式（战斗，decision_mode=action_chunk）</h2>
+<div class="panel">
+<div class="mermaid">
+flowchart TD
+    A[游戏状态（每个动作后都会观测）] --> B{有 pending plan?}
+    B -- 否 --> M[调用一次 LLM<br/>ActionChunk: thought + actions[]]
+    B -- 是 --> C{计划在认知上仍有效?}
+    C -- 是 --> D[解析 plan-scoped ref 到当前索引<br/>validate_action 校验<br/>发送下一个已承诺动作（不调用 LLM）]
+    D --> A
+    C -- 否 --> E[中断计划: HAND_CHANGED / TARGET_GONE /<br/>NEW_TURN / ACTION_REJECTED / MODEL_REQUESTED...]
+    E --> M
+    M --> F[逐动作: 解析引用 → 校验 → 桥接逐个确认]
+    F --> A
+</div>
+<p class="hint">核心不变量：每个动作后都会观测游戏状态，但 LLM 只在认知边界被调用。引用（h0/e0）按"计划创建时的人眼可见身份"解析；手牌索引漂移自动跟随，重复卡按可见身份等价；目标死亡绝不自动换目标；动作被拒（状态无变化）绝不盲目重放。失败策略 <code>benchmark_strict</code>：LLM 失败即标记 benchmark 失效并停止，绝无 Python 策略兜底。上下文历史按 <b>计划级</b>（一个 plan 一轮）记录，而非每个机械动作一轮。</p>
+</div>
+
 <h2>四、兜底动作（确定性安全，绝不触发游戏随机行为）</h2>
 <div class="panel">
 <table>

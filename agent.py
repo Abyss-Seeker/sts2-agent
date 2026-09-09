@@ -587,6 +587,10 @@ class AgentSession:
                 "model_call_count": self._metrics.model_call_count,
                 "game_action_count": self._metrics.game_action_count,
                 "checkpoint_count": self._metrics.checkpoint_count,
+                "plan_completed_count": self._metrics.plan_completed_count,
+                "plan_interrupted_count": self._metrics.plan_interrupted_count,
+                "invalid_plan_count": self._metrics.invalid_plan_count,
+                "fallback_action_count": self._metrics.fallback_action_count,
                 "actions_per_llm_call": (
                     self._metrics.game_action_count / self._metrics.model_call_count
                     if self._metrics.model_call_count else 0.0
