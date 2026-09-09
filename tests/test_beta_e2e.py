@@ -184,6 +184,9 @@ class MockLLM(agent_mod.LLMClient):
 
     def chat(self, messages):
         self.calls += 1
+        # Simulate the real client: one HTTP attempt per chat() call so
+        # the agent's on_http_attempt accounting is exercised.
+        self._notify_http_attempt(self.calls)
         self.prompts.append(messages[-1]["content"])
         if self.fail:
             raise LLMError("simulated LLM timeout")
@@ -305,6 +308,11 @@ def test_one_plan_three_confirmed_actions() -> None:
     assert st["plan_completed_count"] == 1, st
     assert st["plan_interrupted_count"] == 0, st
     assert st["last_checkpoint_reason"] == "NEW_TURN", st
+    # executed_vs_planned counts only CONFIRMED plan actions: plan1's 3
+    # confirmed; plan2's single action was sent but never confirmed.
+    assert st["planned_actions_total"] == 4, st
+    assert st["executed_planned_actions_total"] == 3, st
+    assert abs(st["executed_vs_planned_ratio"] - 0.75) < 1e-9, st
     cps = [e for e in logs if e["kind"] == "plan_checkpoint"
            and e.get("reason") == "NEW_TURN"]
     assert len(cps) == 1 and cps[0]["executed_steps"] == 3, cps
@@ -488,6 +496,74 @@ def test_explicit_checkpoint() -> None:
 
 
 # ----------------------------------------------------------------
+# Single-action confirmation semantics (identical to chunks):
+#   SENT -> next authoritative state -> CONFIRMED / REJECTED
+# ----------------------------------------------------------------
+
+def test_single_action_confirmed_by_next_state() -> None:
+    class LLM(MockLLM):
+        script = [
+            json.dumps({"thought": "hit it",
+                        "action": "play", "card_index": 0, "target_index": 0}),
+            json.dumps({"thought": "done", "action": "end_turn"}),
+        ]
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    # The strike LANDED: enemy HP down, energy down, Strike left the hand.
+    s1 = combat_state("r1", energy=2, hand=[],
+                      enemies=[cultist(34)], discard_count=1)
+
+    s, bridge = run_agent(9128, LLM, cfg={"decision_mode": "single_action"},
+                          states=[s0, s1])
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    assert bridge.actions[0] == {"action": "play", "card_index": 0,
+                                 "target_index": 0}
+    # The visible world moved forward -> the sent strike is CONFIRMED by
+    # the next authoritative state (same definition as chunks).
+    assert st["game_action_sent_count"] == 2, st  # strike + re-prompted end_turn
+    assert st["game_action_confirmed_count"] == 1, st
+    assert st["game_action_rejected_count"] == 0, st
+    assert st["llm_request_count"] == 2, st
+    print("PASS single_action_confirmed_by_next_state")
+
+
+def test_single_action_rejected_by_unchanged_state() -> None:
+    class LLM(MockLLM):
+        script = [
+            json.dumps({"thought": "hit it",
+                        "action": "play", "card_index": 0, "target_index": 0}),
+            json.dumps({"thought": "model re-consulted", "action": "end_turn"}),
+        ]
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    # Human-visibly IDENTICAL state, only request_id differs => the game
+    # did not accept the action.
+    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+
+    s, bridge = run_agent(9129, LLM, cfg={"decision_mode": "single_action"},
+                          states=[s0, s1])
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    # The unchanged state triggers a fresh LLM decision (no replay loop).
+    assert bridge.actions[0] == {"action": "play", "card_index": 0,
+                                 "target_index": 0}
+    assert bridge.actions[-1] == {"action": "end_turn"}, bridge.actions
+    assert st["llm_request_count"] == 2, st
+    # First action: sent == 1, confirmed == 0, rejected == 1. (The second
+    # re-prompted end_turn was sent too but its confirming state never
+    # arrived -- the fake bridge closes -- so it stays unconfirmed.)
+    assert st["game_action_sent_count"] == 2, st
+    assert st["game_action_confirmed_count"] == 0, st
+    assert st["game_action_rejected_count"] == 1, st
+    print("PASS single_action_rejected_by_unchanged_state")
+
+
+# ----------------------------------------------------------------
 # TEST 6 — strict failure: no fallback, request accounting
 # ----------------------------------------------------------------
 
@@ -525,6 +601,8 @@ def run_all() -> None:
         test_rejected_action_no_replay,
         test_explicit_checkpoint,
         test_strict_failure,
+        test_single_action_confirmed_by_next_state,
+        test_single_action_rejected_by_unchanged_state,
     ]
     for fn in tests:
         fn()

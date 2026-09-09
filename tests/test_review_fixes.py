@@ -16,6 +16,7 @@ Run:  python .\\tests\\test_review_fixes.py
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import llm_client as llm_client_mod
 from agent import _looks_like_decision_object, extract_json
 from benchmark_metrics import BenchmarkMetrics
 from deepseek_provider_reference import build_chat_payload
@@ -219,6 +221,110 @@ def test_metrics_sent_confirmed_rejected_and_requests() -> None:
     print("PASS FIX 5 metrics_sent_confirmed_rejected_and_requests")
 
 
+# ----------------------------------------------------------------
+# Item 3A — internal HTTP retries are each counted as a request
+# ----------------------------------------------------------------
+
+class _ScriptedHTTPHandler(BaseHTTPRequestHandler):
+    """Returns scripted (status, body) pairs; 200 with usage by default."""
+    responses: list[tuple[int, dict]] = []
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        status, body = type(self).responses.pop(0) if type(self).responses \
+            else (200, {"choices": [{"message": {"content": "ok"},
+                                     "finish_reason": "stop"}]})
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def _start_scripted_server(responses):
+    handler = type("_H", (_ScriptedHTTPHandler,), {"responses": responses})
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_internal_http_retry_counted() -> None:
+    # Fail twice (HTTP 500) then succeed: ONE llm.chat => THREE real HTTP
+    # attempts, and llm_request_count must be 3 (sleep patched for speed).
+    old_sleep = llm_client_mod.time.sleep
+    llm_client_mod.time.sleep = lambda s: None
+    srv = _start_scripted_server([
+        (500, {"error": "boom"}),
+        (500, {"error": "boom"}),
+        (200, {"choices": [{"message": {"content": "ok"},
+                            "finish_reason": "stop"}]}),
+    ])
+    try:
+        m = BenchmarkMetrics()
+        llm = LLMClient(base_url=f"http://127.0.0.1:{srv.server_address[1]}",
+                        api_key="k", model="m", max_retries=2)
+        attempts: list[int] = []
+        llm.on_http_attempt = lambda a: (
+            attempts.append(a), m.record_llm_request())
+        text = llm.chat([{"role": "user", "content": "hi"}])
+        assert text == "ok", text
+        assert len(attempts) == 3, attempts
+        assert m.llm_request_count == 3, m.snapshot()
+        assert m.llm_failed_request_count == 0  # agent marks failures, not the client
+        assert m.llm_success_count == 0
+    finally:
+        llm_client_mod.time.sleep = old_sleep
+        srv.shutdown()
+    print("PASS item3 internal_http_retry_counted")
+
+
+def test_stale_last_usage_not_reused() -> None:
+    srv = _start_scripted_server([
+        (200, {"choices": [{"message": {"content": "one"},
+                            "finish_reason": "stop"}],
+               "usage": {"prompt_tokens": 10, "completion_tokens": 5}}),
+        (200, {"choices": [{"message": {"content": "two"},
+                            "finish_reason": "stop"}]}),  # NO usage
+    ])
+    try:
+        m = BenchmarkMetrics()
+        llm = LLMClient(base_url=f"http://127.0.0.1:{srv.server_address[1]}",
+                        api_key="k", model="m")
+        llm.on_http_attempt = lambda a: m.record_llm_request()
+        llm.chat([{"role": "user", "content": "a"}])
+        m.record_llm_success(usage=llm.last_usage)
+        assert m.prompt_tokens == 10, m.snapshot()
+
+        llm.chat([{"role": "user", "content": "b"}])
+        # Per-call metadata reset: call 2 had NO usage -> last_usage is
+        # empty and call 1's tokens are NOT counted a second time.
+        assert llm.last_usage == {}, llm.last_usage
+        m.record_llm_success(usage=llm.last_usage)
+        snap = m.snapshot()
+        assert snap["prompt_tokens"] == 10, snap
+        assert snap["completion_tokens"] == 5, snap
+    finally:
+        srv.shutdown()
+    print("PASS item5 stale_last_usage_not_reused")
+
+
+def test_model_call_count_alias_consistent() -> None:
+    m = BenchmarkMetrics()
+    m.record_llm_request()
+    m.record_llm_request()
+    m.record_llm_failure()  # failures never change the alias
+    snap = m.snapshot()
+    assert snap["model_call_count"] == 2 == m.model_call_count, snap
+    assert m.model_call_count == m.llm_request_count
+    m.record_llm_request()
+    assert m.model_call_count == m.llm_request_count == 3
+    print("PASS item6 model_call_count_alias_consistent")
+
+
 def run_all() -> None:
     tests = [
         test_generic_relay_with_deepseek_model_name_gets_no_native_fields,
@@ -227,6 +333,9 @@ def run_all() -> None:
         test_extract_json_repairs_chunk,
         test_streaming_first_token_and_usage_metrics,
         test_metrics_sent_confirmed_rejected_and_requests,
+        test_internal_http_retry_counted,
+        test_stale_last_usage_not_reused,
+        test_model_call_count_alias_consistent,
     ]
     for fn in tests:
         fn()

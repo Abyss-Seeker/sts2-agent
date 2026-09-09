@@ -118,6 +118,8 @@ class LLMClient:
         # Optional live-delta callbacks (UI streaming display).
         self.on_reasoning_delta = None  # callable(str)
         self.on_content_delta = None    # callable(str)
+        # Fired before EVERY real HTTP attempt (see _notify_http_attempt).
+        self.on_http_attempt = None     # callable(attempt:int)
         # First-token latency (FIX: measured once per call, at the FIRST
         # callback delta, relative to the real call-start monotonic ts).
         self._call_start: float = 0.0
@@ -181,8 +183,25 @@ class LLMClient:
         except (TypeError, ValueError):
             pass
 
+    def _notify_http_attempt(self, attempt: int) -> None:
+        """Fired before EVERY real HTTP inference attempt (urlopen), in
+        both the streaming and non-streaming paths. Benchmark accounting
+        hooks llm_request_count here so internal max_retries retries are
+        each counted individually."""
+        cb = self.on_http_attempt
+        if cb is not None:
+            try:
+                cb(attempt)
+            except Exception:
+                pass
+
     def chat(self, messages: list[dict[str, str]]) -> str:
         """Send a chat completion request; returns the assistant text."""
+        # Per-call metadata reset: a provider reply without usage/reasoning
+        # must never let the PREVIOUS call's data leak into accounting.
+        self.last_usage = {}
+        self.last_reasoning = ""
+        self.last_finish_reason = ""
         # First-token latency baseline: one monotonic ts per call; the
         # first streaming delta writes it ONCE (never rewritten per token).
         self._call_start = time.monotonic()
@@ -206,6 +225,9 @@ class LLMClient:
 
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 2):
+            # One llm.chat() may perform several REAL HTTP attempts
+            # (internal max_retries); each is accounted individually.
+            self._notify_http_attempt(attempt)
             try:
                 req = urllib.request.Request(
                     self.endpoint, data=body, headers=headers, method="POST"

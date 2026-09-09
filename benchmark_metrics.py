@@ -13,7 +13,6 @@ class BenchmarkMetrics:
     benchmark_valid: bool = True
     invalidation_reason: str = ""
 
-    model_call_count: int = 0
     strategic_plan_count: int = 0
     game_action_count: int = 0
     model_inspection_count: int = 0
@@ -30,9 +29,12 @@ class BenchmarkMetrics:
     # forward -- screen changes / new turns / terminal all count), or
     # REJECTED when the bridge re-emits an action-relevantly unchanged
     # state. game_action_count stays as the CONFIRMED alias.
+    # UNCONFIRMABLE: the next state arrived but the confirmation could not
+    # be judged reliably -- conservatively NOT counted as confirmed.
     game_action_sent_count: int = 0
     game_action_confirmed_count: int = 0
     game_action_rejected_count: int = 0
+    game_action_unconfirmable_count: int = 0
 
     # logical_inspection_count: cognitive boundaries (model inspect
     # requests). llm_request_count: EVERY real llm.chat() / HTTP
@@ -95,6 +97,12 @@ class BenchmarkMetrics:
         """One failed inference attempt (timeout / HTTP error / abandoned)."""
         self.llm_failed_request_count += 1
 
+    @property
+    def model_call_count(self) -> int:
+        """Legacy alias -- NEVER a separately drifting counter: identical
+        to llm_request_count by definition."""
+        return self.llm_request_count
+
     def record_model_call(
         self,
         *,
@@ -106,7 +114,6 @@ class BenchmarkMetrics:
         """Legacy helper: one successful model call (request + success).
         Kept for the standalone core runtime tests; agent code uses the
         granular request/success/failure API."""
-        self.model_call_count += 1
         self.record_llm_request()
         self.record_llm_success(
             latency_ms=latency_ms,
@@ -120,25 +127,30 @@ class BenchmarkMetrics:
         self.planned_actions_total += max(0, int(action_count))
 
     def record_action_sent(self, *, from_plan: bool = True) -> None:
-        """Handed to the bridge -- NOT yet confirmed."""
+        """Handed to the bridge -- NOT yet confirmed. Does NOT touch
+        executed_planned_actions_total: only CONFIRMED plan actions count
+        as executed."""
         self.game_action_sent_count += 1
-        if from_plan:
-            self.executed_planned_actions_total += 1
 
-    def record_action_confirmed(self) -> None:
+    def record_action_confirmed(self, *, from_plan: bool = False) -> None:
         """Confirmed by the next authoritative bridge state."""
         self.game_action_confirmed_count += 1
         self.game_action_count += 1  # compat alias: game_action_count = CONFIRMED
+        if from_plan:
+            self.executed_planned_actions_total += 1
 
     def record_action_rejected(self) -> None:
         """Bridge re-emitted an action-relevantly unchanged state."""
         self.game_action_rejected_count += 1
 
+    def record_action_unconfirmable(self) -> None:
+        """Confirmation could not be judged reliably (formatter failure /
+        unknown comparison) -- conservatively NOT counted as confirmed."""
+        self.game_action_unconfirmable_count += 1
+
     def record_game_action(self, *, from_plan: bool = True) -> None:
         """Legacy alias: record a CONFIRMED game action."""
-        self.record_action_confirmed()
-        if from_plan:
-            self.executed_planned_actions_total += 1
+        self.record_action_confirmed(from_plan=from_plan)
 
     def record_checkpoint(self, reason: str, *, interrupted: bool = True) -> None:
         self.checkpoint_count += 1
@@ -202,12 +214,13 @@ class BenchmarkMetrics:
         return {
             "benchmark_valid": self.benchmark_valid,
             "invalidation_reason": self.invalidation_reason,
-            "model_call_count": self.model_call_count,
+            "model_call_count": self.model_call_count,  # alias of llm_request_count
             "strategic_plan_count": self.strategic_plan_count,
             "game_action_count": self.game_action_count,  # CONFIRMED alias
             "game_action_sent_count": self.game_action_sent_count,
             "game_action_confirmed_count": self.game_action_confirmed_count,
             "game_action_rejected_count": self.game_action_rejected_count,
+            "game_action_unconfirmable_count": self.game_action_unconfirmable_count,
             "model_inspection_count": self.model_inspection_count,
             "logical_inspection_count": self.logical_inspection_count,
             "llm_request_count": self.llm_request_count,

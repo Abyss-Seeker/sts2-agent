@@ -68,24 +68,31 @@ server.py + static/     # 本地 Web UI（配置 API/模板、观测决策日志
   LLM 成绩。
 
 ### 指标
-严格区分四个维度（`/api/status`）：
-- **推理请求**：`llm_request_count`（每一次真实 HTTP 推理尝试，含超时/
-  HTTP 错误/thinking-only/坏 JSON 重试）、`llm_success_count`、
-  `llm_failed_request_count`、`logical_inspection_count`（认知边界数）；
+严格区分四个维度（`/api/status`），且 **single_action 与 action_chunk
+使用完全相同的确认语义**（SENT → 下一权威状态 → CONFIRMED/REJECTED）：
+- **推理请求**：`llm_request_count`（每一次**真实 HTTP 推理尝试**——由
+  `LLMClient.on_http_attempt` 在每次 urlopen 前触发，内部
+  `max_retries` 重试逐次计数；含超时/HTTP 错误/thinking-only/坏 JSON）、
+  `llm_success_count`、`llm_failed_request_count`、
+  `logical_inspection_count`（认知边界数，一次 inspect 可能对应多次
+  请求）；
 - **游戏动作**：`game_action_sent_count`（已发送）、
   `game_action_confirmed_count`（被下一权威状态确认；`game_action_count`
-  为其兼容别名）、`game_action_rejected_count`（状态无变化被拒）；
+  为其兼容别名）、`game_action_rejected_count`（可见状态无变化被拒）、
+  `game_action_unconfirmable_count`（无法可靠判定——保守地不计
+  confirmed）；
 - **计划**：完成/中断分开统计——计划是否完成与检查点原因是两个独立维度
   （最后一击把战斗带进 reward_screen 时 reason=SCREEN_CHANGED 但
-  plan_completed=true）；
+  plan_completed=true）；`executed_vs_planned_ratio` 只统计 **confirmed**
+  的计划动作；
 - **成本/延迟**：`prompt_tokens`、`completion_tokens`、
   `reasoning_tokens`、`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`
   与 `cache_hit_ratio`（官方 DeepSeek usage）、首 token 延迟
   `first_reasoning_token_ms_p50` / `first_content_token_ms_p50`（流式下
   每次调用只记一次）。
 
-核心 KPI：`actions_per_llm_call > 1`（分母含失败请求），且不增加非法动作
-率、无隐藏信息。
+核心 KPI：`actions_per_llm_call > 1`（分母 = 每一次真实 HTTP 尝试，含
+失败与内部重试），且不增加非法动作率、无隐藏信息。
 
 ### DeepSeek 能力（可选）
 `thinking_enabled` / `reasoning_effort`（low|high|max）通过

@@ -7,6 +7,7 @@ thread, asking the LLM for a JSON decision for every state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import queue
@@ -499,6 +500,11 @@ class AgentSession:
         self._last_model_observation_text = ""
         self._last_plan_executed: list[str] = []
         self._last_model_failure_reason = ""
+        # Single-action pending confirmation: the sent action is only
+        # CONFIRMED/REJECTED by the NEXT authoritative state -- identical
+        # semantics to ActionChunk reconciliation.
+        self._pending_single_action: dict[str, Any] | None = None
+        self._pending_single_before_state: dict[str, Any] | None = None
 
     # ---------------- logging ----------------
 
@@ -564,6 +570,8 @@ class AgentSession:
             self._last_model_observation_text = ""
             self._last_plan_executed = []
             self._last_model_failure_reason = ""
+            self._pending_single_action = None
+            self._pending_single_before_state = None
             self._thread = threading.Thread(
                 target=self._run, name="llm-agent", daemon=True
             )
@@ -622,6 +630,14 @@ class AgentSession:
                 "game_action_sent_count": self._metrics.game_action_sent_count,
                 "game_action_confirmed_count": self._metrics.game_action_confirmed_count,
                 "game_action_rejected_count": self._metrics.game_action_rejected_count,
+                "game_action_unconfirmable_count": self._metrics.game_action_unconfirmable_count,
+                "planned_actions_total": self._metrics.planned_actions_total,
+                "executed_planned_actions_total": self._metrics.executed_planned_actions_total,
+                "executed_vs_planned_ratio": (
+                    self._metrics.executed_planned_actions_total
+                    / self._metrics.planned_actions_total
+                    if self._metrics.planned_actions_total else 0.0
+                ),
                 "checkpoint_count": self._metrics.checkpoint_count,
                 "plan_completed_count": self._metrics.plan_completed_count,
                 "plan_interrupted_count": self._metrics.plan_interrupted_count,
@@ -822,6 +838,10 @@ class AgentSession:
         # Live streaming display hooks (no-ops for nonstreaming calls).
         llm.on_reasoning_delta = lambda d: self._set_live("reasoning", d)
         llm.on_content_delta = lambda d: self._set_live("content", d)
+        # llm_request_count counts EVERY real HTTP inference attempt
+        # (including internal max_retries retries), fired by the client
+        # right before each urlopen -- streaming and non-streaming alike.
+        llm.on_http_attempt = lambda _attempt: self._metrics.record_llm_request()
         # Keep a handle so status() can report model / token usage.
         self._llm = llm
         # Two system prompts: never mix the single-action contract and the
@@ -853,16 +873,22 @@ class AgentSession:
                     self._fail(f"Bridge connection lost: {e}")
                     return
 
-                # Step A: ALWAYS reconcile a previously-sent ActionChunk
-                # action FIRST, whatever screen the new state shows. The
-                # sent action must be confirmed/rejected, checkpoint-logged
-                # and the plan finalized BEFORE routing decides anything.
-                reconcile_event = None
-                if (
-                    cfg.get("decision_mode") == "action_chunk"
-                    and self._plan_executor.inflight is not None
-                ):
-                    reconcile_event = self._reconcile_inflight_if_any(state)
+                # Step A: ALWAYS reconcile previously-sent actions FIRST,
+                # whatever screen the new state shows -- confirmation
+                # semantics are identical in both modes:
+                #   SENT -> next authoritative state -> CONFIRMED / REJECTED.
+                if cfg.get("decision_mode") == "action_chunk":
+                    reconcile_event = None
+                    if self._plan_executor.inflight is not None:
+                        # The sent action must be confirmed/rejected,
+                        # checkpoint-logged and the plan finalized BEFORE
+                        # routing decides anything.
+                        reconcile_event = self._reconcile_inflight_if_any(state)
+                else:
+                    # single_action mode: the sent action's confirmation
+                    # also comes from the next authoritative state.
+                    self._reconcile_pending_single_action(state)
+                    reconcile_event = None
 
                 # Step B: route the newly observed screen.
                 stype = str(state.get("type", "unknown"))
@@ -1106,7 +1132,7 @@ class AgentSession:
         ):
             self._metrics.record_action_rejected()
         else:
-            self._metrics.record_action_confirmed()
+            self._metrics.record_action_confirmed(from_plan=True)
         self._consume_executor_event(event, state)
         return event
 
@@ -1275,9 +1301,8 @@ class AgentSession:
                     ),
                 })
             call_budget = min(remaining - send_margin, llm_call_cap)
-            # Count EVERY inference attempt BEFORE the request, so
-            # timeouts / HTTP errors / abandoned attempts are costed too.
-            self._metrics.record_llm_request()
+            # (llm_request_count is recorded by llm.on_http_attempt --
+            # one count per REAL HTTP attempt, retries included.)
             try:
                 t0 = time.monotonic()
                 raw_reply = self._chat_with_deadline(llm, messages, call_budget)
@@ -1541,7 +1566,7 @@ class AgentSession:
             self._stop.set()
             return
         act = self._fallback_action(state)
-        result = self._execute_counted(act)
+        result = self._send_single_action(act, state)
         self._metrics.record_fallback(reason)
         self._decision_count += 1
         self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
@@ -1732,9 +1757,8 @@ class AgentSession:
             # Single-call cap = configured llm_timeout (a per-call limit),
             # never more than the remaining decision time.
             call_budget = min(remaining - send_margin, llm_call_cap)
-            # Count EVERY inference attempt BEFORE the request (FIX:
-            # failed/abandoned/retried calls must not escape accounting).
-            self._metrics.record_llm_request()
+            # (llm_request_count is recorded by llm.on_http_attempt --
+            # one count per REAL HTTP attempt, retries included.)
             try:
                 t0 = time.monotonic()
                 raw_reply = self._chat_with_deadline(llm, messages, call_budget)
@@ -1799,7 +1823,7 @@ class AgentSession:
                     self._stop.set()
                     return
                 act = self._fallback_action(state)
-                result_note = self._execute_counted(act)
+                result_note = self._send_single_action(act, state)
                 self._metrics.record_fallback(f"LLM API error: {e}")
                 self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
                 self._decision_count += 1
@@ -1877,7 +1901,7 @@ class AgentSession:
 
         if act is not None:
             self._metrics.record_plan(1)
-        result_note = self._execute_counted(act)
+        result_note = self._send_single_action(act, state)
         self._decision_count += 1
         self._log(
             "decision",
@@ -1942,15 +1966,68 @@ class AgentSession:
         # Unknown mode fallback
         return raw_reply.strip()[:300] if raw_reply else "(fallback)"
 
-    def _execute_counted(self, act: dict[str, Any]) -> str:
-        """Single-mode execution accounting: the bridge is synchronous, so
-        a successfully transmitted action is counted sent + confirmed; a
-        connection failure counts sent only (never confirmed)."""
+    def _send_single_action(self, act: dict[str, Any], state: dict[str, Any]) -> str:
+        """Single-action-mode send: this only proves ACTION SENT (never
+        confirmed). The confirmation happens in
+        _reconcile_pending_single_action() against the NEXT authoritative
+        state -- exactly the same semantics as ActionChunk steps."""
         result = self._execute(act)
+        if str(result).startswith("ERROR"):
+            # The action never reached the bridge: not sent, never confirmed.
+            return result
         self._metrics.record_action_sent(from_plan=False)
-        if not str(result).startswith("ERROR"):
-            self._metrics.record_action_confirmed()
+        # Snapshot the before-state (deep copy; the agent owns/reads it).
+        try:
+            snapshot = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        except Exception:
+            snapshot = dict(state)
+        self._pending_single_action = act
+        self._pending_single_before_state = snapshot
         return result
+
+    def _visible_state_fingerprint(self, state: dict[str, Any]) -> str | None:
+        """Generic human-visible state fingerprint (single-action
+        confirmation).
+
+        Uses the SAME formatter the LLM sees, so it works for every screen
+        type (event->event, reward_screen->reward_screen, combat->combat):
+        it contains only human-visible decision information, and
+        request_id is never part of the formatted text. Returns None when
+        formatting fails -- the caller must then NOT claim confirmation.
+        """
+        try:
+            text = format_state(state, None)
+        except Exception:
+            return None
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _reconcile_pending_single_action(self, state: dict[str, Any]) -> None:
+        """Confirm/reject the previously sent single action against the
+        next authoritative bridge state (main-loop Step A for
+        single_action mode)."""
+        act = self._pending_single_action
+        before = self._pending_single_before_state
+        self._pending_single_action = None
+        self._pending_single_before_state = None
+        if act is None or before is None:
+            return
+        fp_before = self._visible_state_fingerprint(before)
+        fp_after = self._visible_state_fingerprint(state)
+        if fp_before is None or fp_after is None or not fp_before or not fp_after:
+            # Conservative: never silently claim a confirmation.
+            self._metrics.record_action_unconfirmable()
+            self._log(
+                "warning",
+                "UNKNOWN_CONFIRMATION: 无法可靠比较动作前后的可见状态，"
+                "该动作既不计为 confirmed 也不计为 rejected。",
+            )
+            return
+        if fp_before == fp_after:
+            # Action-relevantly unchanged state => the game did not accept
+            # the action; identical to the chunk ACTION_REJECTED semantics.
+            self._metrics.record_action_rejected()
+        else:
+            self._metrics.record_action_confirmed(from_plan=False)
 
     def _execute(self, act: dict[str, Any]) -> str:
         assert self._client is not None
