@@ -891,7 +891,12 @@ class AgentSession:
         # llm_request_count counts EVERY real HTTP inference attempt
         # (including internal max_retries retries), fired by the client
         # right before each urlopen -- streaming and non-streaming alike.
-        llm.on_http_attempt = lambda _attempt: self._metrics.record_llm_request()
+        # The combat/non-combat section is a session flag the request
+        # site sets, because the callback itself carries no context.
+        self._combat_section = False
+        llm.on_http_attempt = (
+            lambda _attempt: self._metrics.record_llm_request(
+                combat=self._combat_section))
         # Keep a handle so status() can report model / token usage.
         self._llm = llm
         # Two system prompts: never mix the single-action contract and the
@@ -1408,6 +1413,7 @@ class AgentSession:
         # -- that is the entire performance win.
         self._agent_phase = "thinking"
         # One cognitive boundary per state that needs the model.
+        self._combat_section = True
         self._metrics.record_inspection(combat=True)
         decision_deadline = time.monotonic() + hard_deadline
         try:
@@ -1963,6 +1969,7 @@ class AgentSession:
         # total decision past the game's window.
         decision_deadline = time.monotonic() + hard_deadline
         # One cognitive boundary per state that needs the model.
+        self._combat_section = False
         self._metrics.record_inspection()
         feedback = ""
         prev_action_json = ""
