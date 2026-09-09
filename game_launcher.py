@@ -118,15 +118,22 @@ def ensure_game_running(
     *,
     launch_attempts: int = 3,
     process_timeout: float = 180.0,
+    should_abort=None,
     log=print,
 ) -> bool:
     """Idempotent cold-start (§5/§6/§7): observe, launch at most
     ``launch_attempts`` times (re-observing before every attempt), and
     wait bounded for the game process to appear. Emits launch telemetry.
 
+    ``should_abort`` (agent stop event) is polled in every wait loop so a
+    user stop interrupts the launch immediately instead of after timeouts.
+
     Returns True once the game process is running. Bridge readiness is
     the caller's concern (connect retries).
     """
+    def _aborted() -> bool:
+        return should_abort is not None and should_abort()
+
     if is_game_running():
         log("GAME_PROCESS_RUNNING（无需启动）")
         return True
@@ -138,10 +145,16 @@ def ensure_game_running(
         # Re-observe before every attempt; never spam the same command.
         if is_game_running():
             return True
+        if _aborted():
+            log("GAME_LAUNCH_ABORTED (stop requested).")
+            return False
         if not wait_for_game_gone(timeout=20.0, log=log):
             # Still shutting down -- wait and re-observe instead of launching.
             time.sleep(5.0)
             continue
+        if _aborted():
+            log("GAME_LAUNCH_ABORTED (stop requested).")
+            return False
         log(f"STEAM_LAUNCH_REQUESTED (attempt {attempt}/{launch_attempts})")
         if not launch_via_steam(log=log):
             time.sleep(5.0)
@@ -151,6 +164,9 @@ def ensure_game_running(
             if is_game_running():
                 log(f"GAME_PROCESS_STARTED (attempt {attempt})")
                 return True
+            if _aborted():
+                log("GAME_LAUNCH_ABORTED (stop requested).")
+                return False
             time.sleep(2.0)
         log(f"GAME_PROCESS_NOT_STARTED after attempt {attempt}（超时）。")
     return False

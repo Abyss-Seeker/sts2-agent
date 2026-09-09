@@ -646,7 +646,8 @@ class AgentSession:
             # self._lock and this whole block already holds it (a plain,
             # non-reentrant Lock): logging inside would deadlock start()
             # forever (observed: runner hangs before its first log line).
-            # They are logged right after the lock is released below.
+            # They are flushed AFTER the lock is released below (a log-race
+            # with the worker thread is harmless -- warnings are advisory).
             # Normalize beta knobs to their allowed values.
             if self._config.get("decision_mode") not in ("single_action", "action_chunk"):
                 self._config["decision_mode"] = "single_action"
@@ -684,6 +685,7 @@ class AgentSession:
             self._last_model_failure_reason = ""
             self._pending_single_action = None
             self._pending_single_before_state = None
+            self._run_baseline_snapshot = self._metrics.snapshot()
             self._combat_identity = None
             self._reasoning_context_class = ""
             self._requested_reasoning_effort = ""
@@ -694,6 +696,10 @@ class AgentSession:
                 target=self._run, name="llm-agent", daemon=True
             )
             self._thread.start()
+        # Lock released: flush migration warnings (each _log re-takes the
+        # lock -- safe now; a tiny race with the worker's own logs is fine).
+        for w in prompt_warnings:
+            self._log("warning", w)
 
     def stop(self) -> None:
         self._stop.set()
@@ -899,6 +905,9 @@ class AgentSession:
                 )
                 if ensure_game_running(
                     log=lambda m: self._log("info", m),
+                    launch_attempts=int(cfg.get("game_launch_attempts", 3)),
+                    process_timeout=float(cfg.get("game_process_timeout", 180.0)),
+                    should_abort=self._stop.is_set,
                 ):
                     cold_start = True
                 else:
@@ -911,7 +920,14 @@ class AgentSession:
                     "检测到游戏已在运行：若不在局中，请自己开一局，Agent 会自动接管。",
                 )
 
-        attempts = 150 if cold_start else 30  # cold start can take minutes
+        # Bridge connect deadline (§13): expressed in wall-clock seconds,
+        # not magic attempt counts. 0 = derive from cold_start (300s
+        # cold / 60s warm). reconnect_delay is 2s in the client.
+        default_timeout = 300.0 if cold_start else 60.0
+        connect_timeout = float(
+            cfg.get("bridge_connect_timeout_seconds", default_timeout) or 0
+        ) or default_timeout
+        attempts = max(1, int(connect_timeout / 2.0))
         self._client = STS2GameClient(
             host=cfg["bridge_host"],
             port=int(cfg["bridge_port"]),
@@ -1113,12 +1129,16 @@ class AgentSession:
                         )
                     # Per-run report slice for the continuous runner
                     # (developer/benchmark artifact, never an LLM prompt).
+                    # snapshot = THIS run's metric delta only (the session
+                    # cumulative totals live in the final report).
                     self._log(
                         "run_report",
                         f"{kind} at floor {state.get('floor', '?')}",
                         run_id=self._run_id,
                         result=kind,
-                        snapshot=self._metrics.snapshot(),
+                        snapshot=self._metrics.slice_since(
+                            self._run_baseline_snapshot
+                        ),
                     )
                     if kind in ("NORMAL_VICTORY", "NORMAL_DEFEAT"):
                         resume_ok = self._maybe_resume(same_run=False)
@@ -1248,6 +1268,9 @@ class AgentSession:
             )
         )
         self._run_id = uuid.uuid4().hex[:12]
+        # Per-run metric slice baseline (§22): the runner's run_report
+        # snapshot must be a per-run DELTA, not the cumulative counter.
+        self._run_baseline_snapshot = self._metrics.snapshot()
         self._log("info", f"新 run 开始 (run_id={self._run_id})。")
 
     def _maybe_resume(self, *, same_run: bool = True) -> bool:

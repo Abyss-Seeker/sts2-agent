@@ -313,6 +313,26 @@ class BenchmarkMetrics:
         frac = rank - low
         return ordered[low] * (1 - frac) + ordered[high] * frac
 
+    def slice_since(self, baseline: dict[str, Any]) -> dict[str, Any]:
+        """Per-run metric slice: numeric fields diffed against a baseline
+        snapshot, non-numeric state taken as-is. Latency/token LIST fields
+        cannot be diffed and are omitted from the slice (session totals
+        remain in snapshot()); the runner reports those at session level.
+        """
+        current = self.snapshot()
+        out: dict[str, Any] = {}
+        for key, val in current.items():
+            base = baseline.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) \
+                    and isinstance(base, (int, float)) \
+                    and not isinstance(base, bool):
+                out[key] = max(0, val - base)
+            elif isinstance(val, (list, tuple, dict)):
+                continue  # non-diffable; session-level only
+            else:
+                out[key] = val
+        return out
+
     def snapshot(self) -> dict[str, Any]:
         fresh = self.prompt_cache_miss_tokens
         hit = self.prompt_cache_hit_tokens

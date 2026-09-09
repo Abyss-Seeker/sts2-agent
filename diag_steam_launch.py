@@ -6,11 +6,18 @@ C. game started, mod did not load
 D. mod loaded, bridge not listening
 E. bridge latency beyond timeout
 
-Run: python diag_steam_launch.py
+DESTRUCTIVE COLD-START DIAGNOSTIC: if the game is already running it must
+be killed to test a true cold start. This is OPT-IN -- without
+``--confirm-kill-game`` the diagnostic REFUSES to kill the game and exits.
+Only run it after changing game_launcher.py / Steam lifecycle code; it is
+NOT part of the general smoke/validation flow.
+
+Run: python diag_steam_launch.py --confirm-kill-game
 """
 
 from __future__ import annotations
 
+import argparse
 import socket
 import subprocess
 import sys
@@ -41,10 +48,27 @@ def bridge_open() -> bool:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="DESTRUCTIVE cold-start diagnostic (kills a running"
+                    " game; requires --confirm-kill-game).")
+    parser.add_argument(
+        "--confirm-kill-game", action="store_true",
+        help="explicitly allow killing a running game (required)")
+    args = parser.parse_args()
+
     t0 = time.time()
     print(f"[{elapsed(t0)}] DIAG start", flush=True)
 
     if is_game_running():
+        if not args.confirm_kill_game:
+            print(
+                f"[{elapsed(t0)}] REFUSING: game is running and this"
+                " diagnostic must kill it for a true cold start."
+                " Re-run with --confirm-kill-game, or skip (cold start"
+                " already verified 3/3).",
+                flush=True,
+            )
+            return
         print(f"[{elapsed(t0)}] killing running game first (cold-start test)",
               flush=True)
         subprocess.run(["taskkill", "/F", "/IM", GAME],

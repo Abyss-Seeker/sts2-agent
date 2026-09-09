@@ -153,13 +153,20 @@ class FakeBridge(threading.Thread):
             assert a and a.get("action") == "set_agent_timeout", a
             for st in self.states:
                 send(st)
-                a = recv()
-                if a is None:
+                # Drain protocol control commands (set_fallback/
+                # set_agent_timeout/set_headful/set_fast_mode) until the
+                # actual game action for this state arrives.
+                while True:
+                    a = recv()
+                    if a is None:
+                        return
+                    # bridge_client auto-attaches the state's request_id;
+                    # strip it so assertions stay on the action payload.
+                    a.pop("request_id", None)
+                    if str(a.get("action", "")).startswith("set_"):
+                        continue
+                    self.actions.append(a)
                     break
-                # bridge_client auto-attaches the state's request_id;
-                # strip it so assertions stay on the action payload.
-                a.pop("request_id", None)
-                self.actions.append(a)
             time.sleep(0.3)
         except Exception as e:  # keep the thread from dying loudly
             self.error = str(e)

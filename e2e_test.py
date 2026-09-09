@@ -44,6 +44,10 @@ def fake_bridge():
     assert a and a.get("action") == "set_fallback", a
     a = recv_action()  # set_agent_timeout
     assert a and a.get("action") == "set_agent_timeout", a
+    a = recv_action()  # set_headful (headful/fast mode is config-driven)
+    assert a and a.get("action") == "set_headful", a
+    a = recv_action()  # set_fast_mode
+    assert a and a.get("action") == "set_fast_mode", a
     send({
         "type": "crystal_sphere", "floor": 0, "act": 1,
         "options": [
