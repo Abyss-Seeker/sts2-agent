@@ -68,10 +68,15 @@ final boss of the last act.
 - Killing an enemy ends its threats.
 
 ## Turn flow (combat)
-1. Your turn: you receive energy, draw cards, then repeatedly choose ONE
-   action: play a card, use a potion, or end_turn.
-2. After each action you are re-prompted with the updated state. The turn
-   ends only when you end it.
+1. Your turn: you receive energy, draw cards, then choose actions: play
+   cards, use potions, or end_turn.
+2. The harness observes the authoritative game state after every action.
+   Depending on the decision mode you may be re-prompted after every
+   single action, or (ActionChunk mode) you may commit several
+   already-decided actions in one response and are only shown the state
+   again when genuinely new decision-relevant information appears or a
+   committed action can no longer be executed. The turn ends only when
+   you end it.
 3. Enemy turn: enemies act according to the intents already shown.
 4. Repeat. A combat can last many rounds.
 
@@ -132,6 +137,53 @@ General field rules:
   game would fall back to a RANDOM choice.
 - In combat the ONLY valid actions are play / potion / end_turn.
   "action":"choose" is NOT valid in combat.
+"""
+
+# Backwards-compatible alias: the original single-action-per-call contract.
+SINGLE_ACTION_CONTRACT = CONTRACT
+
+ACTION_CHUNK_CONTRACT = """\
+# RESPONSE FORMAT: ACTION CHUNK (combat turns only - READ CAREFULLY)
+
+Respond with EXACTLY ONE valid JSON object and nothing else.
+No markdown.
+No code fences.
+No text before or after the JSON.
+
+The JSON object must contain a "thought" field (one concise sentence of
+tactical reasoning, not hidden chain-of-thought) and an "actions" field:
+a non-empty, ORDERED list of actions you are committing to.
+
+Action shapes (use the PLAN-SCOPED REFERENCES from the current state):
+  {"kind":"play","card_ref":"h0","target_ref":"e0"}   play card h0 at enemy e0
+  {"kind":"play","card_ref":"h2"}                     play a card that needs no target
+  {"kind":"potion","potion_slot":0,"target_ref":"e0"} use potion slot 0
+  {"kind":"end_turn"}                                 end the turn (must be the LAST action)
+
+Rules:
+- "card_ref" / "target_ref" are PLAN-SCOPED references (h0, h1, ... and
+  e0, e1, ...) assigned in the PLAN-SCOPED REFERENCES block of the
+  current state. They are stable: each ref always means the SAME card or
+  enemy it was assigned to, even after hand order shifts.
+- Never reference a card or enemy that is not listed in the current
+  state. Never speculate about cards that may be drawn later.
+- "end_turn" must be the final action and may appear only once.
+- Add "checkpoint_after": true to an action when you must SEE its result
+  before deciding anything further. Such an action must be the LAST one
+  in the chunk; the harness will stop and re-prompt you after it.
+- Commit several actions only when they are already fully determined by
+  the information visible NOW. If an action's result could change the
+  rest of your plan (draws, generated cards, uncertainty), end the chunk
+  there and set "checkpoint_after": true instead of guessing.
+- Optional "memory_note": one short sentence worth remembering later.
+
+Example:
+{"thought":"Bash sets Vulnerable, Strike follows, Defend blocks the hit.",
+ "actions":[
+   {"kind":"play","card_ref":"h0","target_ref":"e0"},
+   {"kind":"play","card_ref":"h1","target_ref":"e0"},
+   {"kind":"play","card_ref":"h3"},
+   {"kind":"end_turn"}]}
 """
 
 DEFAULT_SYSTEM_TEMPLATE = """\

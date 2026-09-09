@@ -106,7 +106,7 @@ class MockLLM(agent_mod.LLMClient):
             if '"*"' not in last and "STRIKE" in last:
                 pass
             # first combat state -> play strike; second (energy=2) -> end turn
-            if "Energy 3/3" in last:
+            if "Energy: 3/3" in last:
                 return '{"thought": "hit it", "action": "play", "card_index": 0, "target_index": 0}'
             return '{"thought": "done", "action": "end_turn"}'
         if "EVENT" in last:

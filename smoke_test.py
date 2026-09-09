@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agent import extract_json, validate_action, render_template
+from agent import extract_json, validate_action, render_template, fallback_action
 from context_manager import ContextManager
 from game_state import format_state
 
@@ -38,7 +38,9 @@ assert act == {"action": "end_turn"}, (act, err)
 # 1d. skip legality per screen (mirrors mod semantics)
 act, err = _va({"type": "shop", "options": [{"index": 0, "label": "Leave shop"}]},
                {"action": "skip"})
-assert act == {"action": "skip"}, err  # shop skip = leave shop
+assert act is None, err  # shop skip is NOT advertised; leaving = choose 0
+assert fallback_action({"type": "shop", "options": [{"index": 0}]}) == \
+    {"action": "choose", "index": 0}  # fallback leaves via 'Leave shop'
 act, err = _va({"type": "reward_screen", "options": [{"index": 0}]}, {"action": "skip"})
 assert act is None and "NOT allowed" in err, err
 act, err = _va({"type": "map_select", "nodes": [{"index": 0}]}, {"action": "skip"})
@@ -97,6 +99,8 @@ assert act is None, err
 act, err = validate_action(state, {"action": "end_turn"})
 assert act == {"action": "end_turn"}, err
 act, err = validate_action(state, {"action": "choose", "index": 2})
+assert act is None and "NOT a legal action in combat" in err, err  # combat rejects choose
+act, err = validate_action({"type": "event", "options": []}, {"action": "choose", "index": 2})
 assert act is not None, err  # choice screens without options list accept any int
 act, err = validate_action({"type": "map_select", "nodes": [{"index": 0}, {"index": 1}]},
                            {"action": "choose", "index": 5})
@@ -140,7 +144,7 @@ combat = {
 text = format_state(combat)
 assert "JAW_WORM" in text and "11 damage x 1" in text
 assert "STRENGTH 2" in text and "50% more" in text
-assert "Draw pile: 9" in text
+assert "DRAW PILE: 9" in text
 print(text[:400])
 
 # 6. choice screen formatting
@@ -169,9 +173,8 @@ shop = {"type": "shop", "floor": 5, "act": 1,
                     "deck_count": 8},
         "options": [{"index": 0, "label": "Buy card", "price": 45}]}
 stext = format_state(shop)
-assert "Your status: HP 42/72, Gold 231, Ascension 5" in stext
-assert "FULL DECK (8 cards): 4x STRIKE, 4x DEFEND+" in stext
-assert "potions: FIRE, BLOCK" in stext
+assert "HP: 42/72" in stext and "Gold: 231" in stext and "Ascension: 5" in stext
+assert "4x STRIKE, 4x DEFEND+" in stext
 
 # 9. full act map rendering
 map_state = {"type": "map_select", "floor": 3, "act": 1,

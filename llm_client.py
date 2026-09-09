@@ -13,6 +13,13 @@ import time
 import urllib.error
 import urllib.request
 
+from deepseek_provider_reference import (
+    StreamAccumulator,
+    build_chat_payload,
+    detect_capabilities,
+    parse_sse_data_lines,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +62,9 @@ class LLMClient:
         timeout: float = 90.0,
         max_retries: int = 2,
         raw_dump_path: str | None = None,
+        thinking_enabled: bool | None = None,
+        reasoning_effort: str | None = None,
+        stream_mode: str = "off",
     ):
         self.base_url = (base_url or "").rstrip("/")
         if self.base_url.endswith("/chat/completions"):
@@ -81,6 +91,29 @@ class LLMClient:
         # relay/proxy, for pinpointing where content corruption happens
         # (relay bug vs. model output). One JSON line per call.
         self.raw_dump_path = raw_dump_path
+        # ---- Provider capability support (beta) --------------------
+        # DeepSeek official endpoints get thinking/reasoning_effort
+        # fields; generic OpenAI-compatible relays keep the old plain
+        # payload. Streaming stays OFF by default: some relays corrupt
+        # streamed content (observed with a webai2api-style relay).
+        self.caps = detect_capabilities(base_url, model)
+        self.thinking_enabled = thinking_enabled
+        self.reasoning_effort = reasoning_effort
+        self.stream_mode = (stream_mode or "off").lower()
+        # Optional live-delta callbacks (UI streaming display).
+        self.on_reasoning_delta = None  # callable(str)
+        self.on_content_delta = None    # callable(str)
+
+    def _should_stream(self) -> bool:
+        if self.stream_mode == "on":
+            return True
+        if self.stream_mode == "auto":
+            # Only endpoints KNOWN to stream correctly (official DeepSeek).
+            return (
+                self.caps.provider == "deepseek"
+                and "api.deepseek.com" in self.endpoint
+            )
+        return False
 
     def _dump_raw(self, body: bytes, content: str) -> None:
         if not self.raw_dump_path:
@@ -130,18 +163,17 @@ class LLMClient:
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         """Send a chat completion request; returns the assistant text."""
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            # Some OpenAI-compatible proxies (observed with a streaming
-            # webai2api relay) corrupt the response when re-assembling
-            # streamed chunks: bytes go missing from the MIDDLE of the
-            # content while reasoning_content fragments get spliced in.
-            # Requesting a non-streamed response avoids that code path.
-            "stream": False,
-        }
+        use_stream = self._should_stream()
+        payload = build_chat_payload(
+            model=self.model,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            stream=use_stream,
+            capabilities=self.caps,
+            thinking_enabled=self.thinking_enabled,
+            reasoning_effort=self.reasoning_effort,
+        )
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -153,6 +185,16 @@ class LLMClient:
                 req = urllib.request.Request(
                     self.endpoint, data=body, headers=headers, method="POST"
                 )
+                if use_stream:
+                    text = self._chat_streaming(payload)
+                    self._dump_raw(
+                        json.dumps({
+                            "streamed": True,
+                            "finish_reason": self.last_finish_reason,
+                        }).encode("utf-8"),
+                        text,
+                    )
+                    return text
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw_body = resp.read()
                 data = json.loads(raw_body.decode("utf-8"))
@@ -179,6 +221,56 @@ class LLMClient:
             if attempt <= self.max_retries:
                 time.sleep(min(2 ** attempt, 8))
         raise last_err or LLMError("LLM API request failed")
+
+    def _chat_streaming(self, payload: dict) -> str:
+        """Streaming chat completion (SSE). Reasoning/content deltas are
+        accumulated and only the COMPLETE content is returned -- partial
+        JSON is never parsed or acted upon."""
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(
+            self.endpoint, data=body, headers=headers, method="POST"
+        )
+        acc = StreamAccumulator()
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            for event in parse_sse_data_lines(resp):
+                r_delta, c_delta = acc.feed_event(event)
+                if r_delta and self.on_reasoning_delta is not None:
+                    try:
+                        self.on_reasoning_delta(r_delta)
+                    except Exception:
+                        pass
+                if c_delta and self.on_content_delta is not None:
+                    try:
+                        self.on_content_delta(c_delta)
+                    except Exception:
+                        pass
+        self.last_reasoning = acc.reasoning
+        self.last_finish_reason = acc.finish_reason
+        if isinstance(acc.usage, dict):
+            self.last_usage = acc.usage
+            try:
+                self.total_prompt_tokens += int(acc.usage.get("prompt_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                self.total_completion_tokens += int(
+                    acc.usage.get("completion_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+        if not acc.content.strip():
+            if acc.reasoning.strip():
+                raise EmptyContentError(
+                    "流式响应只返回了思考过程(reasoning_content)，未输出回答文本"
+                    f"（finish_reason={acc.finish_reason or '?'}，"
+                    f"reasoning 共 {len(acc.reasoning)} 字符）",
+                    finish_reason=acc.finish_reason,
+                    reasoning=acc.reasoning,
+                )
+            raise LLMError("LLM API streaming response contained no text")
+        return acc.content
 
     @staticmethod
     def _extract_text(data: dict) -> str:

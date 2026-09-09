@@ -595,7 +595,11 @@ def _format_pile(name: str, count: int, composition: Any) -> list[str]:
     return lines
 
 
-def format_combat_state(state: dict[str, Any], run_memory: Any = None) -> str:
+def format_combat_state(
+    state: dict[str, Any],
+    run_memory: Any = None,
+    response_mode: str = "single_action",
+) -> str:
     player = state.get("player", {}) or {}
     enemies = state.get("enemies", []) or []
     energy = player.get("energy", 0)
@@ -661,11 +665,34 @@ def format_combat_state(state: dict[str, Any], run_memory: Any = None) -> str:
     lines.append(f"  Playable cards (hand index): {playable_cards}")
     lines.append(f"  Usable potions (potion slot): {usable_potions}")
     lines.append(f"  Valid enemy targets: {[i for i, e in enumerate(enemies) if e.get('is_alive', False)]}")
-    lines.append("Allowed response shapes for THIS screen (choose EXACTLY ONE):")
-    lines.append('  {"thought":"...","action":"play","card_index":N,"target_index":N}')
-    lines.append('  {"thought":"...","action":"potion","slot":N,"target_index":N}')
-    lines.append('  {"thought":"...","action":"end_turn"}')
-    lines.append("Choose exactly one action. 'choose' is NOT a valid combat action.")
+    if response_mode == "single_action":
+        lines.append("Allowed response shapes for THIS screen (choose EXACTLY ONE):")
+        lines.append('  {"thought":"...","action":"play","card_index":N,"target_index":N}')
+        lines.append('  {"thought":"...","action":"potion","slot":N,"target_index":N}')
+        lines.append('  {"thought":"...","action":"end_turn"}')
+        lines.append("Choose exactly one action. 'choose' is NOT a valid combat action.")
+    else:
+        # ActionChunk mode: plan-scoped refs + chunk schema. The ref
+        # legend is objective, human-visible information only.
+        # Local import keeps game_state importable even if the core
+        # runtime module is absent (single-action mode still works).
+        try:
+            from action_plan import compact_ref_legend
+            lines.append(compact_ref_legend(state))
+        except ImportError:
+            pass
+        lines.append("ACTION-CHUNK RULE: You may commit several actions that are already")
+        lines.append("determined by the information visible now. The harness validates every")
+        lines.append("action against the updated game state. If a later action becomes")
+        lines.append("invalid or new decision-relevant information appears, the harness")
+        lines.append("stops the remaining chunk and asks you again.")
+        lines.append('Respond with ONE JSON object: {"thought":"...","actions":[...]}')
+        lines.append('  {"kind":"play","card_ref":"hN","target_ref":"eN"}  (omit target_ref when the card needs none)')
+        lines.append('  {"kind":"potion","potion_slot":N,"target_ref":"eN"}')
+        lines.append('  {"kind":"end_turn"}  (must be the final action)')
+        lines.append('Optional "checkpoint_after":true on an action = inspect its result before'
+                     ' deciding more (must then be the last action).')
+        lines.append("Only reference cards/enemies listed above. 'choose' is NOT a valid combat action.")
     return "\n".join(lines)
 
 
@@ -1132,8 +1159,18 @@ def is_unsupported_state(state: dict[str, Any]) -> bool:
     )
 
 
-def format_state(state: dict[str, Any], run_memory: Any = None) -> str:
-    """Format any bridge state dict into LLM-readable text."""
+def format_state(
+    state: dict[str, Any],
+    run_memory: Any = None,
+    response_mode: str = "single_action",
+) -> str:
+    """Format any bridge state dict into LLM-readable text.
+
+    ``response_mode`` only affects COMBAT states:
+      - "single_action": the original one-JSON-action legal block (default,
+        unchanged behavior);
+      - "action_chunk": plan-scoped ref legend + ActionChunk schema.
+    """
     stype = str(state.get("type", "unknown"))
     # Multiplayer boundary: this agent officially supports SINGLEPLAYER
     # only. Co-op states are flagged, never claimed as parity-complete.
@@ -1147,7 +1184,7 @@ def format_state(state: dict[str, Any], run_memory: Any = None) -> str:
         pass
     if stype == BridgeStateType.COMBAT_ACTION:
         try:
-            return format_combat_state(state, run_memory)
+            return format_combat_state(state, run_memory, response_mode=response_mode)
         except Exception as e:
             return f"== COMBAT (formatting error: {e}) ==\nraw: {state}"
     if stype in CHOICE_TYPES:

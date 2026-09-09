@@ -10,10 +10,11 @@ const NUM_FIELDS = [
   "bridge_port", "temperature", "max_tokens", "llm_timeout", "llm_retries",
   "agent_timeout",
   "max_history_turns", "max_state_chars", "max_context_chars", "action_delay",
+  "action_chunk_max_actions",
 ];
 const TEXTAREA_FIELDS = ["system_template", "user_template"];
-const SELECT_FIELDS = ["show_thinking"];
-const CHECK_FIELDS = ["disable_fallback", "save_log", "auto_launch_game"];
+const SELECT_FIELDS = ["show_thinking", "decision_mode", "failure_policy", "reasoning_effort", "stream_mode", "thinking_enabled"];
+const CHECK_FIELDS = ["disable_fallback", "save_log", "auto_launch_game", "delta_observations"];
 
 const DEFAULT_PROMPTS = null; // filled from server DEFAULT_CONFIG on load
 let defaults = null;
@@ -33,6 +34,11 @@ function collectConfig() {
   if (Number.isNaN(cfg.llm_retries) || cfg.llm_retries < 0) cfg.llm_retries = 0;
   if (Number.isNaN(cfg.agent_timeout)) cfg.agent_timeout = 90;
   cfg.agent_timeout = Math.min(300, Math.max(10, cfg.agent_timeout));
+  // thinking_enabled is rendered as a select but must be a real boolean.
+  cfg.thinking_enabled = $("thinking_enabled").value === "true";
+  if (!Number.isNaN(cfg.action_chunk_max_actions)) {
+    cfg.action_chunk_max_actions = Math.min(32, Math.max(1, cfg.action_chunk_max_actions));
+  }
   return cfg;
 }
 
@@ -40,7 +46,10 @@ function applyConfig(cfg) {
   TEXT_FIELDS.forEach((id) => ($(id).value = cfg[id] ?? ""));
   NUM_FIELDS.forEach((id) => ($(id).value = cfg[id] ?? ""));
   TEXTAREA_FIELDS.forEach((id) => ($(id).value = cfg[id] ?? ""));
-  SELECT_FIELDS.forEach((id) => ($(id).value = cfg[id] ?? $(id).value));
+  SELECT_FIELDS.forEach((id) => {
+    const v = id === "thinking_enabled" ? String(Boolean(cfg[id])) : cfg[id];
+    $(id).value = v ?? $(id).value;
+  });
   CHECK_FIELDS.forEach((id) => ($(id).checked = Boolean(cfg[id])));
 }
 
@@ -70,6 +79,10 @@ const KIND_LABEL = {
   error: "错误",
   state: "局面",
   warning: "警告",
+  game_action: "动作",
+  model_plan: "计划",
+  plan_checkpoint: "检查点",
+  benchmark_invalidated: "失效",
 };
 
 function renderStatus(st) {
@@ -86,6 +99,20 @@ function renderStatus(st) {
   $("chip-hp").textContent = `HP: ${st.hp ?? "-"}/${st.max_hp ?? "-"}`;
   $("chip-gold").textContent = `金币: ${st.gold ?? "-"}`;
   $("chip-decisions").textContent = `决策: ${st.decision_count}`;
+  if ($("chip-plan")) {
+    const plan = st.current_plan_id
+      ? `${st.current_plan_id} ${st.current_plan_step}/${st.current_plan_total}`
+      : (st.last_checkpoint_reason || "-");
+    $("chip-plan").textContent = `计划: ${plan}`;
+    $("chip-plan").className = "chip " + (st.current_plan_id ? "ok" : "");
+  }
+  if ($("chip-metrics")) {
+    const ratio = st.actions_per_llm_call ? Number(st.actions_per_llm_call).toFixed(1) : "0";
+    $("chip-metrics").textContent =
+      `调用/动作: ${st.model_call_count ?? 0}/${st.game_action_count ?? 0} (${ratio}/次)` +
+      (st.benchmark_valid === false ? " · 已失效" : "");
+    $("chip-metrics").className = "chip " + (st.benchmark_valid === false ? "bad" : "");
+  }
   $("btn-start").disabled = st.running;
   $("btn-stop").disabled = !st.running;
 }

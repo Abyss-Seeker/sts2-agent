@@ -16,6 +16,8 @@ import time
 from collections import deque
 from typing import Any
 
+from action_plan import ActionChunk, PlanParseError, parse_action_chunk
+from benchmark_metrics import BenchmarkMetrics
 from bridge_client import (
     BridgeAction,
     BridgeStateType,
@@ -23,7 +25,9 @@ from bridge_client import (
     TERMINAL_SCREEN_TYPES,
     STS2GameClient,
 )
+from checkpoint import CheckpointReason
 from context_manager import ContextConfig, ContextManager
+from plan_executor import ActionChunkExecutor, ExecutorStatus
 from game_state import (
     RunMemory,
     format_state,
@@ -32,7 +36,14 @@ from game_state import (
     skip_allowed,
 )
 from llm_client import EmptyContentError, LLMClient, LLMError
-from prompts import DEFAULT_SYSTEM_TEMPLATE, DEFAULT_USER_TEMPLATE, RULEBOOK, CONTRACT
+from prompts import (
+    DEFAULT_SYSTEM_TEMPLATE,
+    DEFAULT_USER_TEMPLATE,
+    RULEBOOK,
+    ACTION_CHUNK_CONTRACT,
+    SINGLE_ACTION_CONTRACT,
+)
+from state_diff import render_delta
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +54,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_key": "",
     "model": "gpt-4o-mini",
     "temperature": 0.4,
-    "max_tokens": 512,
+    # Reasoning models can burn the whole budget in reasoning_content; 512
+    # truncates them before any JSON is emitted. 8192 is the beta default.
+    "max_tokens": 8192,
     "llm_timeout": 25,
     # transport_retries: HTTP-level retries for ONE LLM API call (0 keeps the
     # wall time inside the game's decision window). Distinct from
@@ -73,6 +86,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (used to pinpoint where a relay/proxy corrupts replies). Safe to turn
     # off once the relay is fixed.
     "dump_raw_responses": True,
+    # ---- Beta: LLM-native ActionChunk mode -------------------------
+    # decision_mode: "single_action" (baseline, one action per call) or
+    # "action_chunk" (one model plan may drive several individually
+    # confirmed bridge actions; combat only in this beta).
+    "decision_mode": "single_action",
+    # failure_policy: "benchmark_strict" (NO non-LLM fallback: on LLM
+    # failure the benchmark is invalidated and the agent stops) or
+    # "demo_resilient" (deterministic fallback may play; benchmark
+    # invalidated and prominently logged).
+    "failure_policy": "benchmark_strict",
+    "action_chunk_max_actions": 16,
+    # Delta observations: intra-round checkpoint re-prompts may send a
+    # compact objective diff instead of the full state.
+    "delta_observations": True,
+    # DeepSeek thinking controls (generic endpoints ignore them).
+    "thinking_enabled": True,
+    "reasoning_effort": "high",  # low | high | max
+    "stream_mode": "off",        # off | auto | on
 }
 
 
@@ -427,6 +458,23 @@ class AgentSession:
         # (hand signature, card_index) of the last combat fallback, used to
         # avoid retrying a card the game refused.
         self._fallback_attempt: tuple[tuple[tuple[str, bool], ...], int] | None = None
+        # ---- Beta: LLM-native ActionChunk state --------------------
+        self._plan_executor = ActionChunkExecutor()
+        self._metrics = BenchmarkMetrics()
+        self._agent_phase = "idle"  # idle|waiting_game|thinking|plan_ready|executing_plan|checkpoint|failed|terminal
+        self._live_reasoning = ""
+        self._live_content = ""
+        self._current_plan_id = ""
+        self._current_plan_step = 0
+        self._current_plan_total = 0
+        self._current_plan_thought = ""
+        self._plan_executed: list[str] = []
+        self._plan_state_text = ""
+        self._last_checkpoint_reason = ""
+        self._last_model_observation_state: dict[str, Any] | None = None
+        self._last_model_observation_text = ""
+        self._last_plan_executed: list[str] = []
+        self._last_model_failure_reason = ""
 
     # ---------------- logging ----------------
 
@@ -459,11 +507,37 @@ class AgentSession:
             if self._running:
                 raise RuntimeError("Agent already running")
             self._config = {**DEFAULT_CONFIG, **(config or {})}
+            # Normalize beta knobs to their allowed values.
+            if self._config.get("decision_mode") not in ("single_action", "action_chunk"):
+                self._config["decision_mode"] = "single_action"
+            if self._config.get("failure_policy") not in ("benchmark_strict", "demo_resilient"):
+                self._config["failure_policy"] = "benchmark_strict"
+            if self._config.get("stream_mode") not in ("off", "auto", "on"):
+                self._config["stream_mode"] = "off"
+            if self._config.get("reasoning_effort") not in ("low", "high", "max"):
+                self._config["reasoning_effort"] = "high"
             self._stop.clear()
             self._running = True
             self._last_error = ""
             self._decision_count = 0
             self._llm_fail_streak = 0
+            # Reset beta ActionChunk state for the new session.
+            self._plan_executor.reset()
+            self._metrics = BenchmarkMetrics()
+            self._agent_phase = "idle"
+            self._live_reasoning = ""
+            self._live_content = ""
+            self._current_plan_id = ""
+            self._current_plan_step = 0
+            self._current_plan_total = 0
+            self._current_plan_thought = ""
+            self._plan_executed = []
+            self._plan_state_text = ""
+            self._last_checkpoint_reason = ""
+            self._last_model_observation_state = None
+            self._last_model_observation_text = ""
+            self._last_plan_executed = []
+            self._last_model_failure_reason = ""
             self._thread = threading.Thread(
                 target=self._run, name="llm-agent", daemon=True
             )
@@ -505,6 +579,24 @@ class AgentSession:
                 "llm_prompt_tokens": prompt_tokens,
                 "llm_completion_tokens": completion_tokens,
                 "llm_total_tokens": prompt_tokens + completion_tokens,
+                # ---- Beta: ActionChunk runtime status/metrics ----
+                "decision_mode": str(self._config.get("decision_mode", "single_action")),
+                "agent_phase": self._agent_phase,
+                "benchmark_valid": self._metrics.benchmark_valid,
+                "invalidation_reason": self._metrics.invalidation_reason,
+                "model_call_count": self._metrics.model_call_count,
+                "game_action_count": self._metrics.game_action_count,
+                "checkpoint_count": self._metrics.checkpoint_count,
+                "actions_per_llm_call": (
+                    self._metrics.game_action_count / self._metrics.model_call_count
+                    if self._metrics.model_call_count else 0.0
+                ),
+                "current_plan_id": self._current_plan_id,
+                "current_plan_step": self._current_plan_step,
+                "current_plan_total": self._current_plan_total,
+                "last_checkpoint_reason": self._last_checkpoint_reason,
+                "live_reasoning": self._live_reasoning[-400:],
+                "live_content": self._live_content[-200:],
             }
 
     # ---------------- main loop ----------------
@@ -653,12 +745,24 @@ class AgentSession:
             timeout=llm_timeout,
             max_retries=llm_retries,
             raw_dump_path=raw_dump,
+            thinking_enabled=bool(cfg.get("thinking_enabled", True)),
+            reasoning_effort=str(cfg.get("reasoning_effort", "high")),
+            stream_mode=str(cfg.get("stream_mode", "off")),
         )
+        # Live streaming display hooks (no-ops for nonstreaming calls).
+        llm.on_reasoning_delta = lambda d: self._set_live("reasoning", d)
+        llm.on_content_delta = lambda d: self._set_live("content", d)
         # Keep a handle so status() can report model / token usage.
         self._llm = llm
-        system_prompt = render_template(
+        # Two system prompts: never mix the single-action contract and the
+        # ActionChunk contract in one model call.
+        single_system_prompt = render_template(
             cfg["system_template"],
-            {"RULEBOOK": RULEBOOK, "CONTRACT": CONTRACT},
+            {"RULEBOOK": RULEBOOK, "CONTRACT": SINGLE_ACTION_CONTRACT},
+        )
+        chunk_system_prompt = render_template(
+            cfg["system_template"],
+            {"RULEBOOK": RULEBOOK, "CONTRACT": ACTION_CHUNK_CONTRACT},
         )
         # Hard wall-clock budget for ONE DECISION, shared by all retry
         # attempts of the same state (see _handle_state).
@@ -679,10 +783,25 @@ class AgentSession:
                     self._fail(f"Bridge connection lost: {e}")
                     return
                 try:
-                    self._handle_state(
-                        state, llm, system_prompt, hard_deadline,
-                        llm_call_cap=llm_timeout + 1.0,
-                    )
+                    if (
+                        cfg.get("decision_mode") == "action_chunk"
+                        and str(state.get("type")) == BridgeStateType.COMBAT_ACTION
+                    ):
+                        # Beta: combat turns may run a pending ActionChunk
+                        # across multiple bridge handshakes.
+                        self._handle_combat_chunk_state(
+                            state, llm, chunk_system_prompt, hard_deadline,
+                            llm_call_cap=llm_timeout + 1.0,
+                        )
+                    else:
+                        # Noncombat screens and single_action mode keep the
+                        # original one-choice path. A screen change always
+                        # invalidates any pending plan.
+                        self._plan_executor.reset()
+                        self._handle_state(
+                            state, llm, single_system_prompt, hard_deadline,
+                            llm_call_cap=llm_timeout + 1.0,
+                        )
                 except Exception as e:
                     # Never let the worker thread die silently.
                     import traceback
@@ -694,6 +813,8 @@ class AgentSession:
                     self._stop.set()
                     return
                 if str(state.get("type")) in TERMINAL_SCREEN_TYPES:
+                    self._plan_executor.reset()
+                    self._agent_phase = "terminal"
                     self._log("info", "Run finished; agent stopping.")
                     # AUTO-RESUME: the run's save is kept, so wait for the
                     # game to come back instead of tearing the session down.
@@ -788,6 +909,483 @@ class AgentSession:
         self._log("error", message)
         self._running = False
         self._bridge_connected = False
+
+    # ---------------- beta: LLM-native ActionChunk ----------------
+    #
+    # Core invariant: the bridge still handshakes after EVERY action and
+    # the game state is machine-observed after every action, but the LLM
+    # is re-invoked only at cognitive boundaries. The harness decides WHEN
+    # the model must look again -- never WHAT the model should do next.
+
+    # Checkpoint reasons that stay inside the current combat frame; these
+    # may use a compact objective delta instead of a full re-observation.
+    _INTRA_ROUND_CHECKPOINTS = {
+        CheckpointReason.HAND_CHANGED,
+        CheckpointReason.TARGET_GONE,
+        CheckpointReason.CARD_GONE,
+        CheckpointReason.NEXT_ACTION_ILLEGAL,
+        CheckpointReason.ACTION_REJECTED,
+        CheckpointReason.MODEL_REQUESTED,
+        CheckpointReason.POTION_INVALID,
+    }
+
+    def _set_live(self, which: str, delta: str) -> None:
+        with self._lock:
+            if which == "reasoning":
+                self._live_reasoning += delta
+                if len(self._live_reasoning) > 8000:
+                    self._live_reasoning = self._live_reasoning[-4000:]
+            else:
+                self._live_content += delta
+                if len(self._live_content) > 4000:
+                    self._live_content = self._live_content[-2000:]
+
+    def _model_observation_text(self, state: dict[str, Any]) -> str:
+        """FULL or compact DELTA model observation (objective diffs only).
+
+        Falls back to the full formatted state whenever anything is
+        uncertain -- a full state is always safe.
+        """
+        prev = self._last_model_observation_state
+        reason = self._last_checkpoint_reason
+        if (
+            self._config.get("delta_observations", True)
+            and prev is not None
+            and reason
+            and str(prev.get("type")) == str(state.get("type"))
+            and reason in {r.value for r in self._INTRA_ROUND_CHECKPOINTS}
+        ):
+            executed = " -> ".join(self._last_plan_executed[-4:]) or "(none)"
+            text = render_delta(
+                prev, state, executed=executed, checkpoint_reason=reason
+            )
+            # The model answers with plan-scoped refs built from the
+            # CURRENT hand; give it the objective ref mapping.
+            try:
+                from action_plan import compact_ref_legend
+
+                text += "\n\n" + compact_ref_legend(state)
+            except ImportError:
+                pass
+            return text
+        return format_state(state, self._memory, response_mode="action_chunk")
+
+    def _handle_combat_chunk_state(
+        self,
+        state: dict[str, Any],
+        llm: LLMClient,
+        chunk_system_prompt: str,
+        hard_deadline: float,
+        llm_call_cap: float,
+    ) -> None:
+        stype = str(state.get("type", "unknown"))
+        self._current_state_type = stype
+        self._memory.observe(state)
+        executor = self._plan_executor
+
+        if executor.inflight is not None:
+            # This state is the authoritative result of the action we sent.
+            event = executor.accept_state(state)
+            self._consume_executor_event(event, state)
+            if event.status == ExecutorStatus.TERMINAL:
+                return
+            if event.status == ExecutorStatus.READY_ACTION:
+                # Plan remains epistemically valid: prepare the next
+                # committed action against the CURRENT state. No LLM call.
+                next_event = executor.prepare_next(state, validate_action)
+                if next_event.status == ExecutorStatus.READY_ACTION:
+                    self._send_prepared_plan_step(next_event.prepared, state)
+                    return
+                self._consume_executor_event(next_event, state)
+            # NEED_MODEL falls through to the model call below.
+        elif executor.has_pending_plan:
+            # Defensive: a plan exists but no action is in flight.
+            next_event = executor.prepare_next(state, validate_action)
+            if next_event.status == ExecutorStatus.READY_ACTION:
+                self._send_prepared_plan_step(next_event.prepared, state)
+                return
+            self._consume_executor_event(next_event, state)
+
+        # No valid pending plan action remains: ask the model for a chunk.
+        # Never call the LLM before trying to continue a valid pending plan
+        # -- that is the entire performance win.
+        self._agent_phase = "thinking"
+        decision_deadline = time.monotonic() + hard_deadline
+        try:
+            attempts = max(1, int(self._config.get("decision_attempts", 3)))
+        except (TypeError, ValueError):
+            attempts = 3
+        feedback = ""
+        for _attempt in range(attempts):
+            remaining = decision_deadline - time.monotonic()
+            if remaining - 0.5 < 3.0:
+                self._log(
+                    "error",
+                    f"决策剩余时间不足（{remaining:.1f}s），停止重试以避免游戏端超时。",
+                )
+                break
+            chunk = self._request_combat_chunk(
+                state, llm, chunk_system_prompt,
+                decision_deadline=decision_deadline,
+                llm_call_cap=llm_call_cap,
+                feedback=feedback,
+            )
+            if chunk is None:
+                self._handle_model_failure(
+                    state,
+                    self._last_model_failure_reason
+                    or "combat ActionChunk request failed",
+                )
+                return
+            executor.submit(chunk)
+            self._current_plan_id = chunk.plan_id
+            self._current_plan_total = len(chunk.actions)
+            self._current_plan_step = 0
+            self._current_plan_thought = chunk.summary
+            self._plan_executed = []
+            event = executor.prepare_next(state, validate_action)
+            if event.status == ExecutorStatus.READY_ACTION:
+                self._send_prepared_plan_step(event.prepared, state)
+                return
+            # The chunk could not yield even one executable action: retry
+            # with feedback while decision time remains (never a strategic
+            # fallback in strict mode).
+            self._metrics.record_invalid_plan()
+            self._consume_executor_event(event, state)
+            feedback = (
+                "Your chunk was rejected before its first action could be sent: "
+                + (
+                    event.checkpoint.detail
+                    if event.checkpoint is not None and event.checkpoint.detail
+                    else "the first action was invalid"
+                )
+                + "\nThe current state has NOT changed and the plan-scoped refs"
+                " are unchanged. Respond again with EXACTLY ONE valid"
+                " ActionChunk JSON object."
+            )
+        self._handle_model_failure(
+            state, "no valid ActionChunk within the decision deadline"
+        )
+
+    def _request_combat_chunk(
+        self,
+        state: dict[str, Any],
+        llm: LLMClient,
+        chunk_system_prompt: str,
+        decision_deadline: float,
+        llm_call_cap: float,
+        feedback: str = "",
+    ) -> ActionChunk | None:
+        """Request ONE ActionChunk from the model.
+
+        Formats the observation, retries parse/first-step validation
+        inside the shared decision deadline, and records metrics. It does
+        NOT execute anything -- the executor does.
+        """
+        observation_text = self._model_observation_text(state)
+        try:
+            attempts = max(1, int(self._config.get("decision_attempts", 3)))
+        except (TypeError, ValueError):
+            attempts = 3
+        attempt_feedback = feedback
+        prev_chunk_json = ""
+        llm_ms: int | None = None
+        for attempt in range(1, attempts + 1):
+            remaining = decision_deadline - time.monotonic()
+            send_margin = 1.5 if attempt < attempts else 0.5
+            if remaining - send_margin < 3.0:
+                self._last_model_failure_reason = (
+                    f"decision time exhausted ({remaining:.1f}s left)"
+                )
+                self._log(
+                    "error",
+                    f"决策剩余时间不足（{remaining:.1f}s，需保留 {send_margin:.1f}s"
+                    " 发送余量），停止重试以避免游戏端超时。",
+                )
+                return None
+            messages = self._ctx.build_messages(
+                chunk_system_prompt, self._memory.to_text(), observation_text
+            )
+            if attempt_feedback:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous ActionChunk was invalid.\n"
+                        f"Previous response: {prev_chunk_json or attempt_feedback[:200]}\n"
+                        f"Reason: {attempt_feedback}\n"
+                        "The current state above has NOT changed and the"
+                        " plan-scoped refs are unchanged. Respond again with"
+                        " EXACTLY ONE valid ActionChunk JSON object and"
+                        " nothing else."
+                    ),
+                })
+            call_budget = min(remaining - send_margin, llm_call_cap)
+            try:
+                t0 = time.monotonic()
+                raw_reply = self._chat_with_deadline(llm, messages, call_budget)
+                llm_ms = int((time.monotonic() - t0) * 1000)
+                if llm_ms > 15000:
+                    self._log("info", f"LLM 响应耗时 {llm_ms / 1000:.1f}s（较慢）")
+                self._llm_fail_streak = 0
+            except EmptyContentError as e:
+                # Thinking-only reply: warn + retry with a precise hint.
+                self._log(
+                    "warning",
+                    f"LLM 只返回了思考过程、未给出 ActionChunk"
+                    f"（finish_reason={e.finish_reason or '?'}）: {e}",
+                )
+                attempt_feedback = (
+                    "Your previous reply contained ONLY your reasoning and NO"
+                    " answer text, so no ActionChunk was received.\n"
+                    "What was missing: the final JSON object with the"
+                    ' "thought" and "actions" fields.\n'
+                    + (
+                        "Cause: your thinking was cut off by the output length"
+                        " limit (finish_reason=length). Fix: keep reasoning to"
+                        " ONE short sentence and output the JSON immediately.\n"
+                        if e.finish_reason == "length"
+                        else "Fix: skip the long reasoning and output EXACTLY"
+                        " ONE valid JSON object and nothing else.\n"
+                    )
+                    + 'Reply now with e.g. {"thought":"one short tactical'
+                    ' sentence","actions":[{"kind":"end_turn"}]}.\n'
+                    "The current state has NOT changed and the plan-scoped"
+                    " refs are unchanged."
+                )
+                prev_chunk_json = ""
+                continue
+            except LLMError as e:
+                self._last_model_failure_reason = f"LLM API error: {e}"
+                self._log("error", f"LLM API error: {e}")
+                return None
+            except Exception as e:
+                self._last_model_failure_reason = f"unexpected LLM client error: {e}"
+                self._log("error", f"LLM 客户端意外错误: {e}")
+                return None
+            self._metrics.record_model_call(
+                latency_ms=llm_ms,
+                usage=getattr(llm, "last_usage", None) or None,
+            )
+            try:
+                parsed = extract_json(raw_reply)
+            except ValueError as e:
+                attempt_feedback = str(e)
+                self._log(
+                    "error",
+                    f"Unparseable ActionChunk reply (attempt {attempt}): {e}",
+                )
+                continue
+            try:
+                chunk = parse_action_chunk(
+                    parsed, state,
+                    max_actions=max(
+                        1, int(self._config.get("action_chunk_max_actions", 16))
+                    ),
+                )
+            except PlanParseError as e:
+                attempt_feedback = str(e)
+                prev_chunk_json = json.dumps(parsed, ensure_ascii=False)
+                self._log(
+                    "error",
+                    f"Invalid ActionChunk (attempt {attempt}): {e}",
+                )
+                continue
+            # Verify the FIRST action resolves + validates against the
+            # CURRENT authoritative state (no send) using a throwaway
+            # executor; the real executor re-checks before every send.
+            probe = ActionChunkExecutor()
+            probe.submit(chunk)
+            probe_event = probe.prepare_next(state, validate_action)
+            if probe_event.status != ExecutorStatus.READY_ACTION:
+                detail = (
+                    probe_event.checkpoint.detail
+                    if probe_event.checkpoint is not None
+                    else ""
+                )
+                attempt_feedback = (
+                    "your chunk's FIRST action is not executable right now"
+                    + (f": {detail}" if detail else "")
+                    + ". Use only currently playable cards and living targets."
+                )
+                prev_chunk_json = json.dumps(parsed, ensure_ascii=False)
+                self._metrics.record_invalid_plan()
+                self._log(
+                    "error",
+                    f"ActionChunk first step invalid (attempt {attempt}):"
+                    f" {detail}",
+                )
+                continue
+            # Success bookkeeping.
+            self._metrics.record_plan(len(chunk.actions))
+            self._last_model_observation_state = state
+            self._last_model_observation_text = observation_text
+            self._plan_state_text = observation_text
+            actions_repr = [
+                {
+                    "kind": a.kind.value,
+                    **({"card_ref": a.card_ref} if a.card_ref else {}),
+                    **({"target_ref": a.target_ref} if a.target_ref else {}),
+                    **(
+                        {"potion_slot": a.potion_slot}
+                        if a.potion_slot is not None
+                        else {}
+                    ),
+                    **({"checkpoint_after": True} if a.checkpoint_after else {}),
+                }
+                for a in chunk.actions
+            ]
+            self._log(
+                "model_plan",
+                chunk.summary,
+                plan_id=chunk.plan_id,
+                actions=json.dumps(actions_repr, ensure_ascii=False),
+                llm_ms=llm_ms,
+            )
+            self._agent_phase = "plan_ready"
+            return chunk
+        self._last_model_failure_reason = (
+            self._last_model_failure_reason or "all ActionChunk attempts failed"
+        )
+        return None
+
+    def _send_prepared_plan_step(
+        self, prepared: Any, state: dict[str, Any]
+    ) -> None:
+        """Mark + send ONE individually bridge-confirmed plan step."""
+        self._plan_executor.mark_sent(prepared, state)
+        result = self._execute(prepared.bridge_action)
+        self._metrics.record_game_action(from_plan=True)
+        self._current_plan_step = prepared.step_index + 1
+        self._plan_executed.append(prepared.description)
+        self._agent_phase = "executing_plan"
+        self._log(
+            "game_action",
+            prepared.description,
+            plan_id=prepared.plan_id,
+            step_index=prepared.step_index,
+            action=json.dumps(prepared.bridge_action),
+            result=result,
+            source="llm_action_chunk",
+        )
+
+    def _consume_executor_event(
+        self,
+        event: Any,
+        state: dict[str, Any],
+    ) -> None:
+        """Checkpoint logging/metrics/context for executor events."""
+        if event.status in (
+            ExecutorStatus.READY_ACTION,
+            ExecutorStatus.WAITING_RESULT,
+        ):
+            return
+        cp = event.checkpoint
+        if cp is None or cp.reason is CheckpointReason.NONE:
+            return
+        reason = cp.reason
+        executed = list(self._plan_executed)
+        self._last_plan_executed = executed
+        self._last_checkpoint_reason = reason.value
+        if reason is CheckpointReason.PLAN_COMPLETE:
+            self._metrics.record_plan_complete()
+            self._metrics.record_checkpoint(reason.value, interrupted=False)
+        else:
+            self._metrics.record_checkpoint(reason.value, interrupted=True)
+        remaining = max(0, self._current_plan_total - len(executed))
+        self._log(
+            "plan_checkpoint",
+            cp.detail or reason.value,
+            reason=reason.value,
+            plan_id=event.completed_plan_id or self._current_plan_id,
+            executed_steps=len(executed),
+            remaining_steps_discarded=(
+                0 if reason is CheckpointReason.PLAN_COMPLETE else remaining
+            ),
+        )
+        self._add_plan_level_context(
+            event.completed_plan_id or self._current_plan_id,
+            executed,
+            reason,
+            cp.detail,
+        )
+        # Reset per-plan bookkeeping (a fresh chunk sets it again).
+        self._plan_executed = []
+        self._current_plan_id = ""
+        self._current_plan_step = 0
+        self._current_plan_total = 0
+        self._current_plan_thought = ""
+        self._agent_phase = "checkpoint"
+
+    def _add_plan_level_context(
+        self,
+        plan_id: str,
+        executed: list[str],
+        reason: CheckpointReason,
+        detail: str,
+    ) -> None:
+        """Store ONE plan-level history turn per LLM plan -- never one turn
+        per mechanically executed card."""
+        if not self._plan_state_text:
+            return
+        lines = [f"PLAN {plan_id}"]
+        if self._current_plan_thought:
+            lines.append(f"MODEL PLAN: {self._current_plan_thought}")
+        lines.append("EXECUTED: " + ("; ".join(executed) if executed else "(none)"))
+        if reason is CheckpointReason.PLAN_COMPLETE:
+            lines.append("RESULT: Plan completed.")
+        else:
+            lines.append(
+                f"RESULT: Interrupted -- {reason.value}"
+                + (f" ({detail})" if detail else "")
+            )
+        response = json.dumps({
+            "plan_id": plan_id,
+            "thought": self._current_plan_thought,
+            "executed": executed,
+            "result": (
+                "completed"
+                if reason is CheckpointReason.PLAN_COMPLETE
+                else f"interrupted:{reason.value}"
+            ),
+        }, ensure_ascii=False)
+        self._ctx.add_decision(
+            self._plan_state_text, response, "\n".join(lines[1:])
+        )
+        self._plan_state_text = ""
+
+    def _handle_model_failure(self, state: dict[str, Any], reason: str) -> None:
+        """Dispatch an LLM failure according to ``failure_policy``.
+
+        benchmark_strict: NO non-LLM strategic fallback -- invalidate the
+        benchmark and stop. demo_resilient: the deterministic fallback may
+        execute, but the benchmark is invalidated and prominently logged.
+        """
+        if self._config.get("failure_policy", "benchmark_strict") == "benchmark_strict":
+            self._metrics.invalidate(reason)
+            self._agent_phase = "failed"
+            self._log("benchmark_invalidated", reason)
+            self._log("error", "NON-LLM FALLBACK NOT USED — benchmark invalidated (strict mode)")
+            self._fail(
+                f"benchmark_strict：LLM 决策失败（{reason}）；"
+                "不做任何非 LLM 策略兜底，Agent 停止，本局 benchmark 已失效。"
+            )
+            self._stop.set()
+            return
+        act = self._fallback_action(state)
+        result = self._execute(act)
+        self._metrics.record_fallback(reason)
+        self._decision_count += 1
+        self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
+        self._log(
+            "decision",
+            "(LLM 请求失败，demo 兜底动作，benchmark 已失效)",
+            action=json.dumps(act),
+            result=result,
+            state_type=str(state.get("type", "")),
+        )
+        self._ctx.add_decision(
+            format_state(state, self._memory), json.dumps(act), result
+        )
 
     # ---------------- decision handling ----------------
 
@@ -1009,6 +1607,10 @@ class AgentSession:
                 raw_reply = ""
                 continue
             except LLMError as e:
+                # Strict benchmark mode: NO fallback, invalidate + stop.
+                if self._config.get("failure_policy", "benchmark_strict") == "benchmark_strict":
+                    self._handle_model_failure(state, f"LLM API error: {e}")
+                    return
                 # Don't kill the run for one API failure: play the safe
                 # fallback so the game gets an answer inside its window.
                 self._llm_fail_streak += 1
@@ -1022,6 +1624,8 @@ class AgentSession:
                     return
                 act = self._fallback_action(state)
                 result_note = self._execute(act)
+                self._metrics.record_fallback(f"LLM API error: {e}")
+                self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
                 self._decision_count += 1
                 self._log(
                     "decision",
@@ -1036,6 +1640,10 @@ class AgentSession:
                 self._fail(f"LLM 客户端意外错误: {e}")
                 self._stop.set()
                 return
+            self._metrics.record_model_call(
+                latency_ms=llm_ms if llm_ms is not None else None,
+                usage=getattr(llm, "last_usage", None) or None,
+            )
             try:
                 parsed = extract_json(raw_reply)
             except ValueError as e:
@@ -1068,6 +1676,9 @@ class AgentSession:
             break
 
         if act is None:
+            if self._config.get("failure_policy", "benchmark_strict") == "benchmark_strict":
+                self._handle_model_failure(state, "all decision attempts failed")
+                return
             act = self._fallback_action(state)
             # Known screens: protocol-safe deterministic fallback
             # (leave shop / skip allowed card reward / end turn).
@@ -1078,13 +1689,17 @@ class AgentSession:
                 if is_unsupported_state(state)
                 else "protocol-safe fallback"
             )
+            self._metrics.record_fallback("decision attempts exhausted")
             self._log(
                 "error",
                 f"{kind}: {json.dumps(act)} after {attempts} failed"
                 f" decision attempts (shared decision deadline).",
             )
 
+        if act is not None:
+            self._metrics.record_plan(1)
         result_note = self._execute(act)
+        self._metrics.record_game_action(from_plan=False)
         self._decision_count += 1
         self._log(
             "decision",
