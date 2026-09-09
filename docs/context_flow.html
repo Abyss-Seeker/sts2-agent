@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sts2-agent · 每次 LLM API 请求发送了什么</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<style>
+:root { --bg:#0e1116; --panel:#161b23; --panel2:#1c232e; --border:#2a3342;
+        --text:#d8e0ea; --muted:#8b97a8; --accent:#e0a13a; }
+* { box-sizing: border-box; }
+body { margin:24px auto; background:var(--bg); color:var(--text);
+       font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; font-size:14px;
+       padding:0 24px; max-width:1200px; }
+h1 { font-size:20px; } h2 { font-size:16px; color:var(--accent);
+     border-top:1px solid var(--border); padding-top:18px; margin-top:28px; }
+.panel { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+         padding:16px; margin:12px 0; overflow-x:auto; }
+.mermaid { background:var(--panel2); border-radius:8px; padding:12px; }
+pre { background:#0a0d12; border:1px solid var(--border); border-radius:6px;
+      padding:12px; overflow-x:auto; font-size:12px; line-height:1.5;
+      font-family:Consolas,monospace; white-space:pre-wrap; }
+table { border-collapse:collapse; width:100%; font-size:13px; }
+th,td { border:1px solid var(--border); padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:var(--panel2); color:var(--accent); }
+code { background:var(--panel2); border-radius:4px; padding:1px 5px; }
+.hint { color:var(--muted); font-size:12px; }
+.missing { color:#e06c75; font-size:12px; }
+details { margin:8px 0; }
+summary { cursor:pointer; color:var(--accent); padding:6px 0; }
+.chip { display:inline-block; background:var(--panel2); border:1px solid var(--border);
+        border-radius:999px; padding:2px 10px; font-size:12px; margin:2px; }
+</style>
+</head>
+<body>
+
+<h1>🗼 sts2-agent · 每次 LLM API 请求发送了什么</h1>
+<p>每个需要决策的游戏状态都会触发一次独立的 <code>POST /chat/completions</code>。
+API 本身无状态，<b>每个请求都自包含</b>：卡牌/遗物定义在需要时随当前状态重新发送，模型从不需要"记得上一次请求"。
+可用参数：<span class="chip">max_history_turns = 8</span>
+<span class="chip">max_state_chars = 4000（仅历史摘录）</span>
+<span class="chip">max_context_chars = 24000（预算只裁剪历史）</span>
+<span class="chip">decision_attempts = 3（共享同一 deadline）</span>
+<span class="chip">llm_retries = 0（单次 HTTP 传输重试）</span>
+<span class="chip">agent_timeout = 90s（游戏端每决策窗口，可调 10–300s）</span>
+<span class="chip">decision_budget = agent_timeout − 4s（共享 deadline 公式）</span></p>
+
+<h2>〇、两条最高原则（已写入 system prompt 并由格式化器落实）</h2>
+<div class="panel">
+<p><b>1. HUMAN-VISIBLE INFORMATION PARITY</b> — 人类玩家在当前 UI 能无成本查看的信息（屏幕、悬停提示、牌堆查看器、地图、遗物/药水/卡牌 tooltip、升级预览等），LLM 必须以等价文本形式收到；人类当前不知道的信息，LLM 绝不能收到：</p>
+<p class="hint">禁止泄露：抽牌堆真实顺序（bridge 只发送无序组成，与游戏内牌堆查看器一致）· RNG/seed/下一次随机数 · <code>?</code> 地图节点背后的真实房间类型 · 敌人未显示的未来 move · event 隐藏结果 · 内部 AI state / debug flags / 内部计数器（遗物只发送 UI 可见的 counter 与 used-up 状态）。</p>
+<p><b>2. SOURCE OF TRUTH PRIORITY</b>（高 → 低）：</p>
+<pre>1. Current runtime game state and current UI-visible values
+2. Current runtime label / description text（mod 直接截图自 UI 节点）
+3. Static knowledge base（docs/CARDS_REFERENCE.md / RELICS_REFERENCE.md /
+   POWERS_REFERENCE.md —— 全部从当前游戏 build 反编译解析，非 Wiki）
+4. Hardcoded mechanic glossaries（POWER/INTENT/KEYWORD）
+
+冲突时永远信任更高优先级来源。格式化器把静态文本标注为
+"static reference"，绝不覆盖 runtime 数值（如当前费用 vs 基础费用）。</pre>
+</div>
+
+<h2>一、状态分派：哪些状态会送给 LLM</h2>
+<div class="panel">
+<div class="mermaid">
+flowchart TD
+    A["游戏 bridge_mod<br/>TCP :9002 状态 JSON"] --> B["receive_state()"]
+    B -->|"type = pong / ok / error<br/>协议应答, 不是局面"| B1["直接丢弃<br/>不消耗 LLM 调用"]
+    B -->|"type = game_over / run_complete<br/>result: victory / defeat / terminated"| T["记录终局文本<br/>defeat = HP 归零<br/>victory = 正常通关<br/>terminated = 游戏端异常终止<br/>Agent 循环结束"]
+    B -->|"combat_action"| E1["format_combat_state<br/>RUN STATUS 头 + 玩家/权力(全文)/遗物(全文+可见计数)<br/>药水槽(含 EMPTY)/敌人(精确意图伤害)/手牌(当前费用+可打原因)<br/>三堆无序组成 + FULL DECK(来自最近一次牌组快照)<br/>LEGAL ACTIONS(只有 play/potion/end_turn)"]
+    B -->|"map_select event shop rest_site<br/>card_reward card_bundle treasure<br/>boss_relic reward_screen crystal_sphere card_select"| E2["format_choice_state + 分屏合法 schema<br/>选项 label/描述/价格/enabled/可负担性<br/>+ RUN STATUS 头（HP/金币/遗物/药水/完整卡组）"]
+    B -->|"其余未知状态"| E3["format_unknown_state<br/>安全白名单: visible_*/ui_visible/<br/>选项 label/description/enabled/price<br/>raw payload 只进 developer log<br/>正常路径 = 问 LLM; 仅全失败才<br/>emergency deterministic fallback"]
+    E1 --> F["组装 messages 数组"]
+    E2 --> F
+    E3 --> F
+</div>
+</div>
+
+<h2>二、messages[] 的四层拼装（每次请求全部重建）</h2>
+<div class="panel">
+<div class="mermaid">
+flowchart LR
+    subgraph MSGS["POST /chat/completions 请求体 messages"]
+    direction TB
+    M1["① system · 固定不变<br/>信息对等原则 + runtime 优先级<br/>+ 机制规则书（纯 mechanics，零策略建议）<br/>+ 纯 JSON 输出契约"]
+    M2["② system · 滚动决策历史<br/>局面摘要→你的JSON→结果<br/>预算超支时从最旧开始丢弃<br/>历史摘录限 max_state_chars"]
+    M3["③ system · RUN MEMORY 运行记忆<br/>context only：CURRENT STATE 永远赢<br/>缓存最近一次卡组快照供战斗屏使用"]
+    M4["④ user · 当前局面全文<br/><b>绝不按字符截断</b><br/>超出预算时只丢历史，不丢当前局面<br/>+ 要求 EXACTLY ONE valid JSON object"]
+    end
+    LLM["LLM API<br/>temperature / max_tokens<br/>受共享 decision deadline 约束"]
+    M1 --> LLM
+    M2 --> LLM
+    M3 --> LLM
+    M4 --> LLM
+</div>
+<p class="hint">预算优先级：<b>① 当前局面</b>永远完整 → <b>② RUN MEMORY</b> 保留（体积极小且每步重新生成）→ <b>③ 历史摘录</b>最旧先丢。唯一存在的 100k 传输硬帽在触发时按<b>结构化压缩</b>处理（整行删除：先丢 static reference 定义行 → 卡组定义块 → 升级预览行 → Composition 行；保留 legal actions / 手牌 / 敌人 / 玩家状态 / 选项），绝不按字符切片。</p>
+</div>
+
+<h2>三、单次决策时序（共享 deadline / 重试 / 兜底 / 终止）</h2>
+<div class="panel">
+<div class="mermaid">
+sequenceDiagram
+    participant G as 游戏 bridge_mod
+    participant A as Agent 工作线程
+    participant L as LLM API
+    G->>A: 状态 JSON（等待一个动作，agent_timeout 窗口）
+    A->>A: format_state + RunMemory.observe + 组装 messages
+    Note over A: decision_deadline = 现在时刻 + hard_deadline<br/>（min(llm_timeout+1, agent_timeout-4)）<br/>所有重试共享这一个 deadline
+    loop decision_attempts = 3 次（剩余时间 < 2s 则停止）
+        A->>L: messages 全量发送（本次限时 = 剩余时间）
+        L-->>A: 单个 JSON 对象（thought + action）
+        A->>A: extract_json（含 json-repair 修复）
+        A->>A: validate_action（范围/能量/目标/enabled/min-max 选择数/skip 合法性）
+        alt 解析或校验失败
+            A->>A: 反馈=前一个动作+错误原因+合法 schema 提示，重试
+        end
+    end
+    alt 全部失败或 deadline 耗尽
+        A->>A: fallback_action（确定性安全动作，绝不随机）
+    end
+    A->>G: 动作 JSON（play / end_turn / potion / choose / skip）
+    A->>A: 决策写入历史 + 日志 + logs/run_*.jsonl
+    Note over G,L: 超过 agent_timeout → 游戏端终止 run（result=terminated）
+</div>
+<p class="hint">术语区分：<b>transport_retries</b>（<code>llm_retries</code>，单次 HTTP 调用的传输重试，默认 0）≠ <b>decision_validation_attempts</b>（<code>decision_attempts</code>，同一状态最多 3 次解析/校验尝试，共享同一 deadline）。重试反馈包含：前一个动作、被拒原因、"当前状态未变、以上文本仍然准确"、以及本屏合法 schema 指引。</p>
+</div>
+
+<h2>四、兜底动作（确定性安全，绝不触发游戏随机行为）</h2>
+<div class="panel">
+<table>
+<tr><th>屏幕</th><th>fallback</th><th>说明</th></tr>
+<tr><td>combat_action</td><td><code>{"action":"end_turn"}</code></td><td>协议上明确安全</td></tr>
+<tr><td>shop</td><td><code>{"action":"choose","index":0}</code></td><td>option 0 永远是 "Leave shop"；不再用 skip=leave 语义</td></tr>
+<tr><td>card_reward（can_skip=true）</td><td><code>{"action":"skip"}</code></td><td>唯一允许 skip 的地方之一</td></tr>
+<tr><td>其余 choice 屏</td><td>第一个 enabled 选项</td><td>永不发送 skip（大多数屏会退化为随机选择）</td></tr>
+<tr><td>未知屏幕</td><td>第一个 enabled 选项</td><td><b>emergency deterministic fallback</b>（不称 safe，后果未知）；正常路径先问 LLM；raw payload 仅进 developer log</td></tr>
+</table>
+<p class="hint">validator 同步拒绝：<code>choose</code> 出现在战斗 · skip 出现在非授权屏幕（shop 的 skip=leave 语义已从协议中删除）· 选择数量违反 min/max_select · 目标已死 · 选项 DISABLED。</p>
+</div>
+
+<h2>五、各场景注入内容一览</h2>
+<div class="panel">
+<table>
+<tr><th>状态类型</th><th>局面文本（user 层）包含</th><th>特殊说明</th></tr>
+<tr><td>全部决策屏</td><td><b>== RUN STATUS ==</b> 公共头：Character / Ascension / Act / <b>Act area</b> / <b>Current Act Boss</b> / Floor / 当前屏幕 / HP / Gold（+战斗时 Block/Energy）；RELICS（runtime tooltip）；POTION BELT（全槽含 EMPTY + capacity）</td><td><b>已真实冒烟验证</b>：character_id/name、act_info（boss 名）、relic tooltip 均来自真实游戏 JSON</td></tr>
+<tr><td>combat_action</td><td>Round；玩家 powers（<b>runtime tooltip</b>：游戏 HoverTips 管线，IsVisible=false 自动过滤）；角色特有资源<b>显式命名空间</b>；ENEMY[i] HP/Block/意图（精确显示伤害×段数）/powers（runtime tooltip）；HAND[i] 当前费用 vs 基础费用/类型/目标/<b>Playable now + 引擎原因</b>/<b>runtime 渲染卡面</b>/<b>TARGET PREVIEWS（逐目标 hover 等价预览）</b>/<b>Hover information（关键词/附魔 tooltip）</b>；三堆 count+无序组成；<b>FULL DECK = 当前 runtime master deck</b>（bridge 直接序列化，RunMemory 仅旧 mod 兜底）；LEGAL ACTIONS 只有 play/potion/end_turn</td><td>target preview 用与 UI targeting 相同的公共渲染路径（只读、不耗 RNG、不执行动作）；抽牌堆顺序永不发送</td></tr>
+<tr><td>map_select</td><td>完整地图 graph：所有节点 (row,col) + 类型 + 全部连通边 + visited 路径(*)；<code>?</code> 节点显示为 <b>UNKNOWN</b>；AVAILABLE NEXT ROOMS = 唯一合法选择</td><td>bridge 端 PointType 对 ? 节点本来就是 Unknown，不存在泄露</td></tr>
+<tr><td>event</td><td><b>Event title + 当前可见 narrative 正文</b>（LocString.Exists 保护：多页事件缺失条目时不发 loc key）+ 选项 label / 当前 UI 显示的描述 / enabled</td><td>只发 UI 展示的结果描述，隐藏结果绝不预发</td></tr>
+<tr><td>shop</td><td>option 0 = Leave shop + 全部在售商品（label/静态全文定义/当前价格/affordable/Disabled）；card removal 服务</td><td>skip 语义已删除，离开只走 choose 0</td></tr>
+<tr><td>rest_site</td><td>每个选项的当前 UI 标题 + 显示效果文本（含 relic 修改后的实际数值）+ enabled</td><td>Smith 会打开 card_select 二级选择</td></tr>
+<tr><td>card_reward</td><td>can_skip 状态 + 每个候选完整定义（当前费用/类型/升级/静态全文）；can_skip=true 时才出现 skip schema</td><td>skip schema 只在 can_skip 时列出</td></tr>
+<tr><td>card_select</td><td>候选完整定义 + min_select/max_select + 多选 <code>indexes</code> schema</td><td>skip 仅当 min_select=0；validator 校验选择数量</td></tr>
+<tr><td>treasure / boss_relic / crystal_sphere / reward_screen / card_bundle</td><td>generic choice formatter：选项 label/描述/enabled + 静态全文；reward 屏含 proceed 收尾选项；水晶球注明隐藏格子机制</td><td>proceed 选项收尾，不用 skip</td></tr>
+<tr><td>未知类型</td><td>UNSUPPORTED SCREEN TYPE + WARNING + 全部原始字段</td><td>不自动选择，等待补 formatter</td></tr>
+<tr><td>game_over / run_complete</td><td>终局文本：result ∈ <b>victory / defeat / terminated</b></td><td>不调用 LLM，Agent 停止</td></tr>
+</table>
+<p class="hint">静态全文定义（卡牌/遗物）解析自 <code>docs/CARDS_REFERENCE.md</code> / <code>docs/RELICS_REFERENCE.md</code>（当前 build 反编译产物），标注为 "static reference"，永不覆盖 runtime 值。</p>
+</div>
+
+<h2>六、实际发送的内容原文</h2>
+
+<details open>
+<summary>① system 层 · 系统模板开头（固定）</summary>
+<pre>You are the decision-making player for Slay the Spire 2.
+
+Assume no prior knowledge of this particular game build. Everything needed
+for the current decision is provided in the messages; every request is
+self-contained.
+
+Treat CURRENT RUNTIME STATE and CURRENT UI-VISIBLE DESCRIPTIONS as
+authoritative. If they conflict with the rulebook, static reference text,
+history, or run memory, always trust the current runtime state. ...
+
+You may reason strategically using any information a normal human player
+could currently inspect on screen, but you have no access to hidden game
+information (draw pile order, RNG, hidden room types behind '?', future
+enemy moves, hidden event outcomes). ...
+
+Respond with EXACTLY ONE valid JSON object and nothing else. The "thought"
+field should contain only a concise tactical reason.</pre>
+</details>
+
+<details>
+<summary>② system 层 · 规则书 RULEBOOK（纯机制，策略性 heuristic 已全部删除）</summary>
+<pre># SLAY THE SPIRE 2 - GAME MECHANICS RULEBOOK (authoritative only)
+
+## Core numbers
+- HP / Energy（每回合获得，未用即失）/ Block（吸收伤害，下回合开始移除）/ Gold / Potions（不耗能量）
+
+## Damage math
+- Block 先吸收；WEAK -25% / VULNERABLE +50% / STRENGTH、DEXTERITY 加成 / FRAIL
+
+## Cards
+- 手牌有 index / CURRENT energy cost / type / target / 当前效果文本。
+  当前值可能被升级、附魔、诅咒、遗物、power、难度修改 —— 永远以 CURRENT 值为准。
+- 默认回合结束时手牌弃入弃牌堆（Retain 等效果可覆盖）；抽牌堆空时弃牌堆洗回。
+- Exhaust = 本场战斗移除。只打标记 "Playable now: YES" 的牌。
+
+## Keywords：Exhaust / Ethereal / Retain / Innate / Unplayable / X-cost
+## Enemies：意图伤害 = 游戏意图图标显示的精确值
+## Turn flow：play / potion / end_turn 循环
+## The map：MONSTER / ELITE / REST / MERCHANT / TREASURE / BOSS / UNKNOWN（? 节点类型隐藏）
+## Rest sites：以当前 UI 显示的实际治疗数值为准（relic 可修改）
+## Shops：以当前价格为准；离开 = "Leave shop" 选项
+## Upgrades：以实际显示的升级预览/文本为准</pre>
+<p class="hint">已删除的策略性内容（"Focus fire is usually right"、"SMALL focused deck is stronger"、"skip mediocre cards"、"Prefer Rest when HP is low"、"upgraded cards are strictly better"、"Use potions liberally"、"0-cost utility cards are usually good to play"、"Always block..."）不再作为 authoritative 指令出现。</p>
+</details>
+
+<details>
+<summary>③ system 层 · 输出契约 CONTRACT（纯 JSON，无 Explanation 行）</summary>
+<pre># RESPONSE FORMAT (STRICT - READ CAREFULLY)
+
+Respond with EXACTLY ONE valid JSON object and nothing else.
+No markdown.
+No code fences.
+No text before or after the JSON.
+
+The JSON object must contain a "thought" field and an "action" field.
+"thought" should normally be one concise sentence stating the key tactical
+reason for the action. Do not include hidden chain-of-thought.
+
+Example (combat):
+{"thought":"Defend prevents most of the incoming damage.","action":"play","card_index":1,"target_index":-1}
+
+The EXACT set of allowed action shapes is listed at the end of EVERY state
+message under "Allowed response shapes for THIS screen". Use only those
+shapes, and only values listed as legal in the current state.
+
+General field rules:
+- "card_index" = hand index; "target_index" = enemy index or -1;
+  "slot" = potion slot; "index"/"indexes" = 当前屏幕的选项/候选/节点 index。
+- "skip" 仅当当前屏幕明确允许时合法；否则游戏会退化为随机选择，validator 直接拒绝。
+- In combat the ONLY valid actions are play / potion / end_turn.
+  "action":"choose" is NOT valid in combat.</pre>
+</details>
+
+<details open>
+<summary>④ user 层 · 战斗局面文本（示例，每请求自包含）</summary>
+<pre>== RUN STATUS ==
+Character: (not reported by bridge)
+Ascension: 5
+Act: 1
+Floor: 7
+Current screen: COMBAT
+HP: 43/72
+Gold: 231
+Block: 5
+Energy: 2/3
+
+RELICS:
+  BURNING_BLOOD
+    Effect (static reference): BurningBlood
+      AfterCombatVictory: if owner not dead, heal owner for 6
+  VAJRA | visible counter: 1
+    Effect (static reference): Vajra
+      AfterRoomEntered: if combat room, apply 1 Strength to owner
+
+POTION BELT (empty slots shown as EMPTY; potions do NOT cost energy):
+  POTION[0] FIRE_POTION
+    Usable now: yes | Target: AnyEnemy
+  (belt capacity beyond the highest listed slot is not reported by the bridge)
+== COMBAT: YOUR TURN ==
+Round: 3
+
+PLAYER POWERS:
+  STRENGTH 2 -- Strength: attacker's physical damage is increased by this amount per hit.
+CHARACTER-SPECIFIC RESOURCES (all currently shown by the game UI):
+  Stars: 3                      ← Regent（可见性遵循游戏 NStarCounter 规则）
+  ORB SLOTS (in UI order):      ← Defect（有序、含 EMPTY、Passive/Evoke）
+    ORB[0]: LIGHTNING | Passive: 3 | Evoke: 8
+  OSTY: present | Alive: yes    ← Necrobinder
+    HP: 12/30 | Block: 0
+  future_resource = 7           ← 只有 bridge 显式放入 visible_character_state
+                                   命名空间的字段才渲染（任意未知字段绝不透传）
+
+ENEMIES (index = valid target_index; left-to-right as shown):
+  ENEMY[0] JAW_WORM  HP 26/42, Block 0
+      Intent: ATTACK = will attack (exact damage shown) -- displayed attack: 11 damage x 1 hit(s) on you
+      Powers:
+      VULNERABLE 2 -- Vulnerable: target takes 50% more attack damage. Decreases by 1 each turn.
+  ENEMY[1] CULTIST (DEAD)
+
+HAND (one entry per card, in game order):
+  HAND[0] Strike (STRIKE_IRONCLAD)
+    Current cost: 1 energy | Type: Attack | Target: AnyEnemy (requires choosing one living enemy as target (target_index))
+    Playable now: YES
+    Current displayed effect: Deal 17 damage.   ← runtime 渲染卡面（DynamicVar 已解析）
+  HAND[2] Bash (BASH)
+    Current cost: 3 energy | Base/permanent cost: 2 energy | Type: Attack | ...
+    Playable now: NO
+    Reason: engine reason: EnergyCostTooHigh
+    Upgrade preview (as shown by the game): ...（仅 reward/select/bundle 屏提供）
+
+DRAW PILE: 9 cards (unordered, as shown by the pile viewer)
+  Composition: 4x STRIKE_IRONCLAD
+DISCARD PILE: 2 cards (unordered, as shown by the pile viewer)
+EXHAUST PILE: 0 cards (unordered, as shown by the pile viewer)
+
+FULL DECK (10 cards) [last seen on a screen with deck access; runtime is authoritative]:
+  Composition: 4x DEFEND_IRONCLAD, 1x STRIKE_IRONCLAD+, 4x STRIKE_IRONCLAD, 1x BASH
+  Card definitions (static reference):
+  STRIKE_IRONCLAD+: ... Upgraded change: Damage+3
+
+LEGAL ACTIONS RIGHT NOW:
+  Playable cards (hand index): [0, 1]
+  Usable potions (potion slot): [0]
+  Valid enemy targets: [0]
+Allowed response shapes for THIS screen (choose EXACTLY ONE):
+  {"thought":"...","action":"play","card_index":N,"target_index":N}
+  {"thought":"...","action":"potion","slot":N,"target_index":N}
+  {"thought":"...","action":"end_turn"}
+Choose exactly one action. 'choose' is NOT a valid combat action.</pre>
+</details>
+
+<details>
+<summary>⑤ user 层 · 完整地图文本（示例）</summary>
+<pre>== RUN STATUS == ...（公共头）...
+== MAP: choose the next room to visit ==
+FULL ACT MAP (row: room type -> connected next nodes; '*' = on your visited path):
+  row 2: (2,4) *REST -> [(3,3)] | (2,7) UNKNOWN (hidden room type, shown as '?' in the game) -> [(3,6)]
+  row 1: (1,3) *MONSTER -> [(2,4)] | (1,6) ELITE -> [(2,7)]
+AVAILABLE NEXT ROOMS (these are the ONLY nodes you may pick):
+  OPTION[0] REST | row=2 | col=4
+Allowed response shapes for THIS screen (choose EXACTLY ONE):
+  {"thought":"...","action":"choose","index":i}</pre>
+</details>
+
+<details>
+<summary>⑥ user 层 · Shop 文本（示例，skip 语义已删除）</summary>
+<pre>== RUN STATUS == ...（公共头，含 Gold 用于可负担性）...
+== SHOP: spend gold on cards / relics / potions / services ==
+Prices are the current shop prices as shown; DISABLED = sold out or
+unaffordable. To leave, pick the 'Leave shop' option.
+OPTIONS:
+  OPTION[0] Leave shop
+  OPTION[1] CLOVE | description=Cost: 150 | price=150
+      Affordable now: YES
+  OPTION[2] VAJRA | description=Cost: 999 | price=999 | (currently DISABLED - do not choose)
+      Affordable now: NO (price 999 > gold 231)
+  OPTION[3] remove_card | description=Cost: 75 | price=75
+      Affordable now: YES
+Allowed response shapes for THIS screen (choose EXACTLY ONE):
+  {"thought":"...","action":"choose","index":i}
+  skip is NOT allowed on this screen (it would trigger a random pick).</pre>
+</details>
+
+<h2>七、历史条目与预算裁剪示例</h2>
+<div class="panel">
+<pre>RECENT DECISIONS (oldest first, context only). Each shows the situation you faced,
+the JSON you answered, and what happened:
+[t-3] STATE:
+== CARD REWARD == ...（限 max_state_chars 的局面摘录）
+YOUR ANSWER: {"thought": "...", "action": "skip"}
+RESULT/FEEDBACK: skipped
+...（预算超支时从最旧开始丢弃；当前局面永不参与裁剪）</pre>
+<p class="hint">裁剪顺序：历史旧条目先丢 → 历史新条目 → RUN MEMORY 保留 → 当前局面永远完整。RUN MEMORY 声明 "context only -- CURRENT STATE is always correct"。</p>
+</div>
+
+<h2>八、本轮已实现（runtime 渲染信息 + 信息安全）与仍缺字段</h2>
+<div class="panel">
+<p><b>已实现（C# bridge 真实字段，来自当前 build API）：</b></p>
+<table>
+<tr><th>字段</th><th>C# 来源（已验证 API）</th></tr>
+<tr><td>手牌/候选卡当前渲染文本（Deal 17 damage 等动态数值）</td><td><code>CardModel.GetDescriptionForPile(...)</code> → <code>current_display_text</code>（游戏自己的 DynamicVar 管线，BBCode 已剥离）；<code>CardSerialization.SerializeCardFull</code>（combat hand / card reward / card select / card bundle 共用）</td></tr>
+<tr><td>升级预览</td><td><code>CardModel.GetDescriptionForUpgradePreview()</code> → <code>upgrade_preview_text</code>（reward/select/bundle 屏；手牌不显示预览，与 UI 一致）</td></tr>
+<tr><td>当前费用 vs 基础费用 / X 费用 / Star 费用</td><td><code>EnergyCost.GetWithModifiers/Canonical/CostsX</code>、<code>GetStarCostWithModifiers/CurrentStarCost/HasStarCostX</code></td></tr>
+<tr><td>Enchantment / Affliction</td><td><code>card.Enchantment/Affliction</code> 的 Title + DynamicDescription → 独立字段；<b>pile/deck 分组键含修饰符</b>（不同修饰符的卡永不合并）</td></tr>
+<tr><td>不可打原因</td><td><code>CanPlay(out UnplayableReason...)</code> flags → <code>unplayable_reasons</code>（与 UI 灰显同一引擎依据）</td></tr>
+<tr><td>药水完整 tooltip + 腰带容量 + EMPTY 槽</td><td><code>PotionModel.Title/DynamicDescription</code>；<code>player.MaxPotionCount</code> → <code>potion_slot_capacity</code>；所有槽位含空槽全部序列化</td></tr>
+<tr><td>遗物 runtime tooltip</td><td><code>RelicModel.Title/DynamicDescription</code>（RunSummary + 战斗）→ Python 优先渲染 runtime，反编译 static 仅兜底</td></tr>
+<tr><td>角色身份</td><td><code>player.Character.Id/Title</code> → <code>character_id</code>/<code>character_name</code></td></tr>
+<tr><td>Regent Stars / Defect Focus+有序 Orbs / Necrobinder Osty</td><td><code>CardSerialization.BuildVisibleCharacterState</code>：可见性遵循游戏 UI 规则（<code>ShouldAlwaysShowStarCounter||Stars&gt;0</code> = NStarCounter 逻辑、<code>BaseOrbSlotCount&gt;0</code>、<code>character is Necrobinder</code>）；Orbs 保持 UI 顺序含空槽与 Passive/Evoke 值</td></tr>
+</table>
+<p><b>信息安全规则（本轮收紧）：</b></p>
+<p class="hint">① 删除了"player 未知字段自动透传"——任意未知 player/enemy 字段绝不出现在 Prompt；只有 bridge 显式放入 <code>visible_character_state</code> / <code>ui_visible</code> 命名空间的内容才通用渲染（C# decides visibility, Python preserves semantics）。② unknown screen 改为<b>安全白名单</b>：只发 visible_*/ui_visible/选项 label/description/enabled/price + canonical run status；raw payload 只进 developer log（run_*.jsonl），永不进 Prompt。③ unknown screen 正常路径 = 安全格式化后问 LLM（不自动选）；仅当全部 decision attempts 失败/deadline 耗尽才执行"emergency deterministic fallback（第一个 enabled 选项）"——明确不称 safe，因为其游戏后果未知。已知屏 fallback（Leave shop / can_skip 的 skip / end_turn）仍称 protocol-safe。④ error 状态语义已验证：mod 从不主动发 <code>error</code>；游戏拒绝动作时由 handler 重新序列化同一状态再次询问，不存在"action rejected but still waiting"消息类型（已在 bridge_client.receive_state 注释记录）。</p>
+<p><b>deadline 公式（修正）：</b></p>
+<p class="hint"><code>decision_budget = agent_timeout − 4s</code>（不再是 <code>min(llm_timeout+1, …)</code> 把整个决策窗口截短）；每次 API call <code>call_budget = min(llm_timeout+1, 剩余决策时间 − 发送余量)</code>。agent_timeout=90 / llm_timeout=25 时三次 attempts 真正可用。transport_retries（HTTP 层）与 decision_attempts（parse/validate 重试）继续分离。</p>
+<p><b>STILL MISSING HUMAN-VISIBLE FIELDS（诚实清单）：</b></p>
+<table>
+<tr><th>缺失字段</th><th>原因 / 下一步</th></tr>
+<tr><td>selection source（"为什么在选"的来源卡/药水/prompt 文本）</td><td>ICardSelector 接口（options/min/max）不带来源上下文，CardSelectCmd 调用发生在游戏内部；candidates 已带完整卡面与 selection_screen_prompt（若存在）。下一步：扩展 ICardSelector 签名或 hook CardSelectCmd</td></tr>
+<tr><td>商店折扣细节（原价/折扣%）</td><td>UI 若显示折扣可在 shop handler 读取 Entry 价格差；当前只发 runtime 实际价格 + affordable（不猜测折扣来源）</td></tr>
+<tr><td>Ascension 当前生效 modifier 列表</td><td>未审计 UI 是否无成本展示完整列表；当前只发数字（不硬编码旧版 modifier）</td></tr>
+<tr><td>combat_action 冒烟未完成</td><td>两次真实冒烟均在开局（Neow/event）阶段游戏界面卡死（用户手动关闭），combat JSON 的 runtime 字段（current_display_text/powers tooltip/target_previews）未在真实运行中验证——JSON 结构与 C# 路径已被 65 项测试与上一次 run 的 event/reward JSON 验证。已知游戏侧不稳定问题（run 中/后进程消失）此前已记录</td></tr>
+</table>
+<p><b>真实游戏冒烟结果（2026-09-08）：</b></p>
+<p class="hint">DLL 自动部署（dotnet build → E:\...\Slay the Spire 2\mods\STS2BridgeMod\STS2BridgeMod.dll）→ 游戏重启 → bridge :9002 连接成功 → 真实 JSON 确认：character_id=IRONCLAD / character_name="The Ironclad"、act_info（Underdocks/Overgrowth + boss 名 "Lagavulin Matriarch"/"Ceremonial Beast"）、relic runtime tooltip（"At the end of combat, heal 6 HP."）、potion 全空槽 + capacity=3、runtime deck、map 全图 edges（? 节点为 Unknown）、event_title。同时发现并修复 <b>P0 bug</b>：EnrichWithRunSummary 原先嵌套注入导致 Python 拿不到 player 字段（已改为扁平注入 + act_info 顶层）。combat 状态未及验证（游戏卡死）。</p>
+</div>
+
+<h2>九、测试覆盖</h2>
+<div class="panel">
+<p><code>tests/test_sts2_agent_contract.py</code> + <code>tests/test_sts2_agent_parity_round2.py</code>（共 49 项，全部通过）覆盖：战斗完整字段与 legal actions 无 <code>choose</code> · 遗物/权力全文 · 角色资源<b>显式命名空间</b>透传 + 未知字段绝不暴露 · 卡组跨屏快照 · runtime 费用优先于静态 KB · 地图 UNKNOWN 不泄露 · card_reward 全候选+can_skip 门控 skip · shop 无 skip · card_select min/max · 隐藏信息拦截（intent_move_id/RNG/seed/堆序）· 纯 JSON 契约 · victory/defeat/terminated；本轮新增（Test S–AM）：药水 runtime tooltip · 腰带容量+EMPTY · 渲染卡面覆盖静态（Deal 17 vs 6）· 当前/基础费用 · 附魔卡不合并分组 · 升级预览 · 遗物 runtime tooltip 优先于反编译 static · 角色身份 · Stars 命名空间 · Defect 有序 Orbs · Osty · 隐藏 player 字段拦截 · unknown 屏无 raw dump / 正常路径问 LLM / 仅失败才 emergency fallback · 结构化压缩无 substring · error 语义记录 · static reference 无实现细节。</p>
+</div>
+
+<script>
+mermaid.initialize({ startOnLoad: true, theme: "dark", flowchart: { curve: "basis" } });
+</script>
+</body>
+</html>

@@ -1,0 +1,150 @@
+:root {
+  --bg: #0e1116;
+  --panel: #161b23;
+  --panel2: #1c232e;
+  --border: #2a3342;
+  --text: #d8e0ea;
+  --muted: #8b97a8;
+  --accent: #e0a13a;
+  --green: #47c06b;
+  --red: #e05252;
+  --blue: #4a9de0;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+header h1 { font-size: 18px; margin: 0; }
+
+#status-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.chip {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.chip.ok { color: var(--green); border-color: var(--green); }
+.chip.bad { color: var(--red); border-color: var(--red); }
+.chip.warn { color: var(--accent); border-color: var(--accent); }
+
+.header-actions { margin-left: auto; display: flex; gap: 8px; }
+
+main {
+  display: grid;
+  grid-template-columns: 400px 1fr;
+  gap: 16px;
+  padding: 16px 20px;
+  align-items: start;
+}
+@media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+#config-panel, #feed-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+#config-panel h2, #feed-panel h2 { margin: 0 0 12px; font-size: 15px; }
+#config-panel section {
+  border-top: 1px solid var(--border);
+  padding: 12px 0;
+}
+#config-panel h3 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
+
+label { display: block; margin: 6px 0; }
+label.lbl { color: var(--muted); font-size: 12px; margin-top: 10px; }
+label.chk { display: flex; align-items: center; gap: 6px; }
+
+.row { display: flex; gap: 8px; }
+.row label { flex: 1; }
+
+input[type="text"], input[type="password"], input[type="number"], select, textarea {
+  width: 100%;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 13px;
+  font-family: inherit;
+}
+textarea { font-family: Consolas, monospace; resize: vertical; line-height: 1.45; }
+input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+.hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+
+button {
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #1a1206; font-weight: 600; }
+button.danger { background: transparent; border-color: var(--red); color: var(--red); }
+button.ghost { background: transparent; color: var(--muted); margin-top: 6px; }
+button.wide { width: 100%; margin-top: 12px; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+#feed {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: calc(100vh - 130px);
+  overflow-y: auto;
+}
+
+.log {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  background: var(--panel2);
+  border-radius: 6px;
+  padding: 8px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+.log.decision { border-left-color: var(--green); }
+.log.decision .tag { color: var(--green); }
+.log.error { border-left-color: var(--red); }
+.log.error .tag { color: var(--red); }
+.log.warning { border-left-color: var(--accent); }
+.log.warning .tag { color: var(--accent); }
+.log.info { border-left-color: var(--blue); }
+.log.info .tag { color: var(--blue); }
+.log.state { border-left-color: var(--muted); opacity: 0.85; }
+.log.state .tag { color: var(--muted); }
+.log .tag { font-weight: 700; font-size: 11px; margin-right: 8px; }
+.log .action {
+  margin-top: 6px;
+  font-family: Consolas, monospace;
+  color: var(--accent);
+  font-size: 12px;
+}

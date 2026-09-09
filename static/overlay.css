@@ -1,0 +1,239 @@
+/* overlay.css -- 录视频 / 直播用的展示叠加层。
+ *
+ * 页面背景完全透明：只有「基本信息条」和「日志块」有半透明底板，
+ * 其余区域一律留空，让下面的游戏画面透出来（OBS 浏览器源直接吃这页）。
+ */
+
+:root {
+  --panel: rgba(12, 16, 22, 0.60);
+  --panel-strong: rgba(12, 16, 22, 0.86);
+  --border: rgba(140, 165, 200, 0.30);
+  --text: #eaf1f8;
+  --muted: #a9bcd2;
+  --accent: #e0a13a;
+  --green: #47c06b;
+  --red: #e05252;
+  --blue: #4a9de0;
+  /* 左右两列宽度：UI 只占这两列，游戏画面（投屏/透出）只住中间 */
+  --left-w: 250px;
+  --right-w: 350px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+
+/* ---------- 基本信息条（左；mirror 时右） ----------
+ * 竖排窄条贴边摆放：信息在左、日志在右，中间大片区域完全留空，
+ * 尽量不压住任何游戏画面。 */
+#hud-top {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  right: auto;
+  width: calc(var(--left-w) - 24px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(4px);
+}
+
+.stat { display: inline-flex; align-items: baseline; gap: 6px; }
+.stat i {
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: .5px;
+}
+.stat b { font-size: 17px; font-weight: 700; }
+
+.chip {
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.chip.ok { color: var(--green); border-color: rgba(71, 192, 107, .5); }
+.chip.bad { color: var(--red); border-color: rgba(224, 82, 82, .5); }
+
+/* ---------- 左下：网络 / 报错 + 模型信息 ---------- */
+#hud-net {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  width: calc(var(--left-w) - 24px);
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(4px);
+  overflow: hidden;
+}
+
+#net-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 24vh;
+  overflow-y: auto;
+}
+#net-list .entry { border-left-color: var(--muted); font-size: 12px; }
+#net-list .entry.err { border-left-color: var(--red); }
+#net-list .entry.warn { border-left-color: var(--accent); }
+#net-list .entry .e-thought { font-size: 12px; }
+
+#model-box {
+  flex: none;
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.m-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+.m-row i { font-style: normal; color: var(--muted); }
+.m-row b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 最近决策日志（右；mirror 时左） ----------
+ * 与信息条分居两侧。最新一条在最上面，旧的被往下挤；超出高度时
+ * 裁掉的是最旧的一条，最新内容永远可见。 */
+#hud-log {
+  position: fixed;
+  top: 52px;              /* 让出右上角的切换器 */
+  bottom: 12px;
+  right: 12px;
+  left: auto;
+  width: calc(var(--right-w) - 24px);
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  backdrop-filter: blur(4px);
+  overflow: hidden;
+}
+
+.log-head {
+  flex: none;
+  font-size: 12px;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+#log-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;       /* 日志填满整列，历史可在列内滚动翻看 */
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.entry { border-left: 3px solid var(--accent); padding: 2px 0 2px 9px; }
+.entry .e-meta { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+.entry .e-thought { font-size: 14px; }
+.entry .e-action { font-size: 12.5px; color: var(--blue); margin-top: 2px; }
+.entry .e-res { color: var(--muted); }
+.entry.empty {
+  border-left-color: var(--border);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ---------- UI 切换（右上角区域，不顶角） ---------- */
+#ui-switch {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px;
+  background: var(--panel-strong);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  backdrop-filter: blur(4px);
+  z-index: 10;
+}
+
+#ui-switch .sw,
+#ui-switch .sw-ghost {
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+#ui-switch .sw:hover,
+#ui-switch .sw-ghost:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+#ui-switch .sw.active {
+  color: #0e1116;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+
+/* mirror：两块交换左右；切换器跟到另一角，避免压住面板；
+   中间列画面也跟着换边（列宽互换，总宽不变） */
+body.mirror #hud-top { left: auto; right: 12px; }
+body.mirror #hud-net { left: auto; right: 12px; }
+body.mirror #hud-log { right: auto; left: 12px; }
+body.mirror #ui-switch { right: auto; left: 12px; }
+body.mirror #bg-video { left: var(--right-w); }
+
+/* 纯净录制：?chrome=0 隐藏切换控件 */
+body.no-chrome #ui-switch { display: none; }
+
+/* ---------- 窗口投屏背景 ----------
+ * 通过 getDisplayMedia 捕获用户选定的窗口（通常是游戏），作为本页最底层
+ * 画面；信息条与日志叠在它上面。不投屏时页面依旧全透明（OBS 用）。
+ */
+#bg-video {
+  position: fixed;
+  top: 0;
+  left: var(--left-w);    /* 游戏画面只占中间列：绝不与两侧 UI 重叠 */
+  /* video 是替换元素：绝对定位下 width/height:auto 会退回视频固有分辨率
+     （left/right 约束被忽略）——那正是"画面巨大只露左上角"的原因，
+     所以尺寸必须用 calc 显式给出。 */
+  width: calc(100vw - var(--left-w) - var(--right-w));
+  height: 100vh;
+  object-fit: contain;    /* 中间列内等比缩放——画面可能变小但不变形 */
+  z-index: -1;
+  display: none;
+  background: #000;
+}
+body.casting { background: #000; }        /* 投屏时黑底，边框更自然 */
+body.casting #bg-video { display: block; }
+body.casting.fit-cover #bg-video { object-fit: cover; }

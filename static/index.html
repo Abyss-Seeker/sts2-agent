@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STS2 LLM Agent 控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>🗼 杀戮尖塔 2 · LLM Agent 控制台</h1>
+  <div id="status-chips">
+    <span class="chip" id="chip-agent">Agent: 未知</span>
+    <span class="chip" id="chip-bridge">桥接: 未知</span>
+    <span class="chip" id="chip-state">界面: -</span>
+    <span class="chip" id="chip-floor">楼层: -</span>
+    <span class="chip" id="chip-hp">HP: -</span>
+    <span class="chip" id="chip-gold">金币: -</span>
+    <span class="chip" id="chip-decisions">决策: 0</span>
+  </div>
+  <div class="header-actions">
+    <button id="btn-start" class="primary">▶ 启动 Agent</button>
+    <button id="btn-stop" class="danger">■ 停止</button>
+    <button id="btn-overlay"
+            title="打开展示叠加层（录视频 / 直播用：只显示基本信息与最近决策，背景透明）"
+            onclick="window.open('/overlay','_blank')">⛶ 展示模式</button>
+  </div>
+</header>
+
+<main>
+  <aside id="config-panel">
+    <h2>⚙️ 配置</h2>
+
+    <section>
+      <h3>游戏桥接</h3>
+      <label>主机 <input id="bridge_host" type="text"></label>
+      <label>端口 <input id="bridge_port" type="number"></label>
+      <label>游戏端决策等待(秒) <input id="agent_timeout" type="number" min="10" max="300"></label>
+      <label class="chk"><input id="auto_launch_game" type="checkbox"> 游戏没开时自动通过 Steam 启动并开新局</label>
+      <label>Steam AppID <input id="steam_appid" type="text"></label>
+      <p class="hint">游戏已在运行时不会重启：若不在局中，请自己开一局，Agent 自动接管；run 结束后 mod 不会自动开新局，重启游戏（勾选此项会自动重启）即可再来。等待窗口会连同其余配置在连接时下发给 mod（需新版 bridge_mod），默认 90s——用 reasoning 模型可调到 120~300。</p>
+    </section>
+
+    <section>
+      <h3>LLM API（OpenAI 兼容）</h3>
+      <label>API Base URL <input id="api_base_url" type="text" placeholder="https://api.openai.com"></label>
+      <label>API Key <input id="api_key" type="password" placeholder="sk-..."></label>
+      <label>模型 <input id="model" type="text" placeholder="gpt-4o-mini"></label>
+      <div class="row">
+        <label>Temperature <input id="temperature" type="number" step="0.1" min="0" max="2"></label>
+        <label>Max Tokens <input id="max_tokens" type="number"></label>
+      </div>
+      <div class="row">
+        <label>超时(秒) <input id="llm_timeout" type="number" min="1" max="295"></label>
+        <label>失败重试次数 <input id="llm_retries" type="number" min="0" max="3"></label>
+      </div>
+      <p class="hint">兼容 OpenAI / DeepSeek / Moonshot / Qwen / Ollama / vLLM 等，Base URL 不带 /v1 时会自动补全。LLM 超时会被钳制到「游戏端等待窗口 − 5s」（另有 1s 硬性总时限余量）；重试会成倍占用窗口时间，默认 0——单次失败会用安全兜底动作继续游戏。慢速 reasoning 模型请同步调大"游戏端决策等待"。</p>
+    </section>
+
+    <section>
+      <h3>提示词模板</h3>
+      <label class="lbl">系统提示（占位符：{{RULEBOOK}} 规则书、{{CONTRACT}} 输出契约）</label>
+      <textarea id="system_template" rows="8" spellcheck="false"></textarea>
+      <label class="lbl">用户消息模板（占位符：{{RUN_MEMORY}} 运行记忆、{{STATE}} 当前局面）</label>
+      <textarea id="user_template" rows="4" spellcheck="false"></textarea>
+      <button id="btn-reset-prompts" class="ghost">↺ 恢复默认模板</button>
+    </section>
+
+    <section>
+      <h3>上下文管理</h3>
+      <div class="row">
+        <label>历史轮数 <input id="max_history_turns" type="number" min="0" max="24"></label>
+        <label>单状态上限 <input id="max_state_chars" type="number"></label>
+        <label>上下文预算 <input id="max_context_chars" type="number"></label>
+      </div>
+      <p class="hint">历史按预算从最旧开始裁剪；运行记忆（HP/金币/事件）始终保留，保证长局不丢失全局信息。</p>
+    </section>
+
+    <section>
+      <h3>选项</h3>
+      <label>思考显示
+        <select id="show_thinking">
+          <option value="full">显示完整思考</option>
+          <option value="brief">一句话解释（thought 字段）</option>
+          <option value="hidden">不显示思考</option>
+        </select>
+      </label>
+      <label>行动间隔(秒) <input id="action_delay" type="number" min="0" step="0.1" placeholder="0 = 不限速"></label>
+      <p class="hint">每个动作发送前的停顿，用于放慢节奏观察 LLM 表现；0 表示全速。</p>
+      <label class="chk"><input id="disable_fallback" type="checkbox"> 禁用游戏端随机替打（推荐）</label>
+      <label class="chk"><input id="save_log" type="checkbox"> 保存决策日志到 logs/</label>
+    </section>
+
+    <button id="btn-save" class="primary wide">💾 保存配置</button>
+    <p class="hint">"启动 Agent" 会先自动保存当前配置再连接。</p>
+  </aside>
+
+  <section id="feed-panel">
+    <h2>📜 决策日志</h2>
+    <div id="feed"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

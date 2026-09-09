@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STS2 Agent · 展示叠加层</title>
+<link rel="stylesheet" href="/static/overlay.css">
+</head>
+<body>
+  <!-- 投屏背景：捕获指定窗口（游戏）后作为本页底层画面，其余 UI 叠在它上面 -->
+  <video id="bg-video" autoplay muted playsinline></video>
+
+  <!-- UI 切换：放在右上角区域，刻意不顶到屏幕角 -->
+  <div id="ui-switch">
+    <button class="sw active" data-mode="overlay">展示</button>
+    <button class="sw" data-mode="console">控制台</button>
+    <button class="sw-ghost" id="btn-cast" title="选择一个窗口（游戏）投屏到本页背景">投屏</button>
+    <button class="sw-ghost" id="btn-fit" title="画面填充方式：适应 / 铺满" hidden>适应</button>
+    <button class="sw-ghost" id="btn-mirror" title="把信息条与日志换到另一侧">⇄</button>
+  </div>
+
+  <!-- 基本信息 -->
+  <div id="hud-top">
+    <span class="stat"><i>楼层</i><b id="s-floor">-</b></span>
+    <span class="stat"><i>HP</i><b id="s-hp">-</b></span>
+    <span class="stat"><i>金币</i><b id="s-gold">-</b></span>
+    <span class="stat"><i>决策</i><b id="s-decisions">0</b></span>
+    <span class="stat"><i>界面</i><b id="s-state">-</b></span>
+    <span class="chip" id="s-agent">Agent: 未知</span>
+    <span class="chip" id="s-bridge">桥接: 未知</span>
+  </div>
+
+  <!-- 左下：网络 / 报错 + 模型与用量 -->
+  <div id="hud-net">
+    <div class="log-head">网络 / 报错</div>
+    <div id="net-list"><div class="entry empty">暂无异常</div></div>
+    <div id="model-box">
+      <div class="m-row"><i>模型</i><b id="m-name">-</b></div>
+      <div class="m-row"><i>Tokens</i><b id="m-tokens">-</b></div>
+      <div class="m-row"><i>Credits</i><b id="m-cost">-</b></div>
+    </div>
+  </div>
+
+  <!-- 最近几条决策日志 -->
+  <div id="hud-log">
+    <div class="log-head">最近决策</div>
+    <div id="log-list"><div class="entry empty">等待决策…</div></div>
+  </div>
+
+  <script src="/static/overlay.js"></script>
+</body>
+</html>

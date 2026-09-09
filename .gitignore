@@ -1,0 +1,15 @@
+# Secrets — contains the real API key; never commit the real file.
+config.json
+
+# Large recordings / media
+videos/
+
+# Ephemeral run logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
