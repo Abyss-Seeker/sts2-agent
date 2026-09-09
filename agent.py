@@ -603,6 +603,10 @@ class AgentSession:
         # semantics to ActionChunk reconciliation.
         self._pending_single_action: dict[str, Any] | None = None
         self._pending_single_before_state: dict[str, Any] | None = None
+        # B1: seed controller metadata + the bridge's start_run ack
+        # (requested vs actual). NEVER part of the LLM observation.
+        self._seed_requested: str = ""
+        self._seed_ack: dict[str, Any] | None = None
         # Adaptive reasoning state
         self._reasoning_context_class = ""
         self._requested_reasoning_effort = ""
@@ -692,6 +696,8 @@ class AgentSession:
             self._last_model_failure_reason = ""
             self._pending_single_action = None
             self._pending_single_before_state = None
+            self._seed_requested = ""
+            self._seed_ack = None
             self._run_baseline_snapshot = self._metrics.checkpoint()
             self._combat_identity = None
             self._reasoning_context_class = ""
@@ -990,6 +996,23 @@ class AgentSession:
             self._fail(f"Lost bridge while setting headful mode: {e}")
             return
 
+        # B1: explicit, seed-controlled run start (formal paired A/B). The
+        # seed is controller metadata only -- it is never put in the LLM
+        # observation (human parity: the game UI does not show it).
+        seed = str(cfg.get("seed") or "")
+        if seed:
+            self._seed_requested = seed
+            try:
+                self._client.start_run(
+                    seed,
+                    character=cfg.get("character"),
+                    difficulty=int(cfg.get("difficulty", 0) or 0),
+                )
+                self._log("info", f"已请求显式开局 start_run(seed={seed})。")
+            except ConnectionError as e:
+                self._fail(f"Lost bridge while requesting start_run: {e}")
+                return
+
         self._memory = RunMemory()
         self._ctx = ContextManager(
             config=ContextConfig(
@@ -1083,6 +1106,13 @@ class AgentSession:
                 except (ConnectionError, TimeoutError, OSError) as e:
                     self._fail(f"Bridge connection lost: {e}")
                     return
+
+                # B1: start_run acknowledgement is controller metadata --
+                # it is not a game screen and must never be routed to the
+                # model (seed must not reach the LLM observation).
+                if str(state.get("type")) == "start_run_ack":
+                    self._handle_start_run_ack(state)
+                    continue
 
                 # Step A: ALWAYS reconcile previously-sent actions FIRST,
                 # whatever screen the new state shows -- confirmation
@@ -1437,6 +1467,28 @@ class AgentSession:
         self._log("error", message)
         self._running = False
         self._bridge_connected = False
+
+    def _handle_start_run_ack(self, state: dict[str, Any]) -> None:
+        """B1: record requested vs ACTUAL seed. seed_applied_to_game is
+        only true on an exact match; a mismatch invalidates the run
+        (never silently continue as if the pair were seeded)."""
+        self._seed_ack = dict(state)
+        requested = str(state.get("requested_seed") or self._seed_requested)
+        actual = str(state.get("actual_seed") or "")
+        match = bool(state.get("seed_match")) and requested == actual
+        success = bool(state.get("success"))
+        self._log(
+            "info",
+            f"start_run ack: requested={requested} actual={actual}"
+            f" match={match} success={success}"
+            + (f" error={state.get('error')}" if state.get("error") else ""),
+        )
+        if not success or not match:
+            self._metrics.invalidate(
+                "SEED_MISMATCH: start_run requested="
+                f"{requested} actual={actual} success={success}")
+            self._log("benchmark_invalidated",
+                      "SEED_MISMATCH: seed not applied to the game")
 
     # ---------------- beta: LLM-native ActionChunk ----------------
     #

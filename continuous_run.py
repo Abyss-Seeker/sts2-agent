@@ -357,6 +357,11 @@ def execute_suite(
                             "ended_at": e.get("ts"),
                             "benchmark_valid": None,  # stamped below
                             "censored": False,
+                            # B1: only the bridge's seed acknowledgement
+                            # may claim the seed reached the game.
+                            "seed_applied_to_game": bool(
+                                (getattr(session, "_seed_ack", None) or {})
+                                .get("seed_match", False)),
                             "metrics": e.get("snapshot") or {},
                         })
                         emit(f"RUN REPORT: {e.get('run_id')}"
@@ -366,6 +371,13 @@ def execute_suite(
                             e.get("run_id") or rid or "?")
                         emit(f"BENCHMARK INVALID"
                              f" (run {e.get('run_id') or '?'}): {e['text']}")
+
+                # B1: keep the frozen experiment config honest about the
+                # seed once the bridge acknowledges it.
+                ack = getattr(session, "_seed_ack", None)
+                if ack and state.experiment_configs:
+                    state.experiment_configs[-1]["seed_applied_to_game"] = \
+                        bool(ack.get("seed_match"))
 
                 # Stamp benchmark validity onto runs not yet stamped: the
                 # agent invalidates the SESSION, so every run emitted

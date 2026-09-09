@@ -275,6 +275,23 @@ class STS2GameClient:
             "seconds": int(seconds),
         })
 
+    def start_run(self, seed: str, character: str | None = None,
+                  difficulty: int = 0) -> None:
+        """B1: request an EXPLICIT run with a controller-provided seed.
+
+        The bridge answers asynchronously with a ``start_run_ack`` state
+        (requested vs ACTUAL seed); the agent records it and only then may
+        the benchmark claim ``seed_applied_to_game``.
+        """
+        action = {"action": "start_run", "seed": str(seed)}
+        if character:
+            action["character"] = str(character)
+        try:
+            action["difficulty"] = int(difficulty or 0)
+        except (TypeError, ValueError):
+            action["difficulty"] = 0
+        self.send_action(action)
+
     def set_headful(self, enabled: bool) -> None:
         """Headful: game stays interactive (BGM/SFX/waits on)."""
         self.send_action({
