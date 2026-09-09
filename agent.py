@@ -59,7 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "temperature": 0.4,
     # Reasoning models can burn the whole budget in reasoning_content; 512
     # truncates them before any JSON is emitted. 8192 is the beta default.
-    "max_tokens": 8192,
+    "max_tokens": 6144,
     "llm_timeout": 25,
     # transport_retries: HTTP-level retries for ONE LLM API call (0 keeps the
     # wall time inside the game's decision window). Distinct from
@@ -113,7 +113,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # "fixed": one effort for every call (legacy `reasoning_effort`
     # migrates to `reasoning_effort_fixed`). "adaptive": per-context
     # class effort; all values come from config, never hard-coded.
-    "reasoning_policy": "fixed",          # fixed | adaptive
+    "reasoning_policy": "adaptive",       # fixed | adaptive (fresh default)
     "reasoning_effort_fixed": "high",     # low | medium | high | max | xhigh
     "reasoning_effort_combat_entry": "high",
     "reasoning_effort_combat_followup": "low",
@@ -143,6 +143,57 @@ def _looks_like_decision_object(obj: Any) -> bool:
     )
 
 
+PROMPT_SCHEMA_VERSION = 2
+
+
+def migrate_prompt_config(user_config: dict[str, Any]) -> tuple[dict, list[str]]:
+    """Prompt schema migration (§5).
+
+    - A saved system/user template that EXACTLY matches a known obsolete
+      default is auto-upgraded to the current default (the old benchmark
+      policy "Assume no prior knowledge..." must not silently survive).
+    - A genuinely CUSTOM template is preserved untouched; the caller gets
+      a warning list for the UI/status.
+    Returns (config, warnings).
+    """
+    from prompts import (
+        DEFAULT_SYSTEM_TEMPLATE,
+        DEFAULT_USER_TEMPLATE,
+        LEGACY_DEFAULT_SYSTEM_TEMPLATES,
+        LEGACY_DEFAULT_USER_TEMPLATES,
+        PROMPT_SCHEMA_VERSION,
+    )
+
+    warnings: list[str] = []
+    cfg = dict(user_config)
+    saved_schema = cfg.get("prompt_schema_version")
+    if saved_schema == PROMPT_SCHEMA_VERSION and "system_template" in cfg:
+        return cfg, warnings
+
+    st = cfg.get("system_template")
+    if st in LEGACY_DEFAULT_SYSTEM_TEMPLATES:
+        cfg["system_template"] = DEFAULT_SYSTEM_TEMPLATE
+        warnings.append(
+            "Legacy default system prompt auto-upgraded to the current"
+            " benchmark policy (prior knowledge allowed, current game"
+            " authoritative, no runtime web)."
+        )
+    elif st is not None and st != DEFAULT_SYSTEM_TEMPLATE:
+        warnings.append(
+            "Custom system prompt from an older schema retained."
+            " Review/reset it manually if you want the new benchmark"
+            " policy."
+        )
+
+    ut = cfg.get("user_template")
+    if ut in LEGACY_DEFAULT_USER_TEMPLATES:
+        cfg["user_template"] = DEFAULT_USER_TEMPLATE
+        warnings.append("Legacy default user template auto-upgraded.")
+
+    cfg["prompt_schema_version"] = PROMPT_SCHEMA_VERSION
+    return cfg, warnings
+
+
 def migrate_reasoning_config(user_config: dict[str, Any]) -> dict[str, Any]:
     """Legacy migration (§3): a user config that only carries the old
     ``reasoning_effort`` key (and no explicit ``reasoning_effort_fixed``)
@@ -152,8 +203,11 @@ def migrate_reasoning_config(user_config: dict[str, Any]) -> dict[str, Any]:
         return user_config
     if user_config.get("reasoning_effort") and not user_config.get(
             "reasoning_effort_fixed"):
+        # Backward compat: an old config pins ONE effort -- keep the old
+        # fixed behaviour instead of silently switching to adaptive.
         user_config["reasoning_effort_fixed"] = str(
             user_config["reasoning_effort"])
+        user_config["reasoning_policy"] = "fixed"
     return user_config
 
 
@@ -575,10 +629,16 @@ class AgentSession:
         with self._lock:
             if self._running:
                 raise RuntimeError("Agent already running")
+            # Prompt schema migration runs on the RAW user config so a
+            # saved legacy default is upgraded before the merge.
+            migrated_prompts, prompt_warnings = migrate_prompt_config(
+                dict(config or {}))
             self._config = {
                 **DEFAULT_CONFIG,
-                **migrate_reasoning_config(dict(config or {})),
+                **migrate_reasoning_config(migrated_prompts),
             }
+            for w in prompt_warnings:
+                self._log("warning", w)
             # Normalize beta knobs to their allowed values.
             if self._config.get("decision_mode") not in ("single_action", "action_chunk"):
                 self._config["decision_mode"] = "single_action"
@@ -1538,7 +1598,13 @@ class AgentSession:
         except (TypeError, ValueError):
             attempts = 3
         feedback = ""
-        for _attempt in range(attempts):
+        # §3: ONE shared attempt budget for the whole authoritative state.
+        # The outer loop (chunk rejected before its first action) and the
+        # inner request loop (parse/schema/ref/first-step retries) draw
+        # from the SAME pool, so decision_attempts=3 means at most 3
+        # logical model decisions -- never 3x3.
+        budget = {"left": attempts}
+        while budget["left"] > 0:
             remaining = decision_deadline - time.monotonic()
             if remaining - 0.5 < 3.0:
                 self._log(
@@ -1551,6 +1617,9 @@ class AgentSession:
                 decision_deadline=decision_deadline,
                 llm_call_cap=llm_call_cap,
                 feedback=feedback,
+                base_reasoning_context=context_class,
+                is_retry=bool(feedback),
+                budget=budget,
             )
             if chunk is None:
                 self._handle_model_failure(
@@ -1597,24 +1666,31 @@ class AgentSession:
         decision_deadline: float,
         llm_call_cap: float,
         feedback: str = "",
+        base_reasoning_context: str = "combat_followup",
+        is_retry: bool = False,
+        budget: dict[str, int] | None = None,
     ) -> ActionChunk | None:
         """Request ONE ActionChunk from the model.
 
         Formats the observation, retries parse/first-step validation
         inside the shared decision deadline, and records metrics. It does
         NOT execute anything -- the executor does.
+
+        ``budget`` is a SHARED attempt counter with the caller (§3):
+        ``decision_attempts`` bounds the TOTAL logical model decisions
+        for one authoritative state -- never outer x inner attempts.
         """
         observation_text = self._model_observation_text(state)
-        try:
-            attempts = max(1, int(self._config.get("decision_attempts", 3)))
-        except (TypeError, ValueError):
-            attempts = 3
         attempt_feedback = feedback
         prev_chunk_json = ""
         llm_ms: int | None = None
-        for attempt in range(1, attempts + 1):
+        attempt = 0
+        while budget is None or budget["left"] > 0:
+            attempt += 1
+            if budget is not None:
+                budget["left"] -= 1
             remaining = decision_deadline - time.monotonic()
-            send_margin = 1.5 if attempt < attempts else 0.5
+            send_margin = 0.5
             if remaining - send_margin < 3.0:
                 self._last_model_failure_reason = (
                     f"decision time exhausted ({remaining:.1f}s left)"
@@ -1644,6 +1720,11 @@ class AgentSession:
             call_budget = min(remaining - send_margin, llm_call_cap)
             # (llm_request_count is recorded by llm.on_http_attempt --
             # one count per REAL HTTP attempt, retries included.)
+            # Retry semantics (§2): every call after the first -- including
+            # a first call that already carries outer feedback -- uses the
+            # retry effort.
+            self._apply_reasoning(
+                base_reasoning_context, retry=(is_retry or attempt > 1))
             self._log_prompt_forensics(messages)
             try:
                 t0 = time.monotonic()
@@ -2348,10 +2429,17 @@ class AgentSession:
         try:
             state_chars = len(messages[-1]["content"]) if messages else 0
             middle = messages[1:-2] if len(messages) > 3 else []
+            # §7: history TURN count = real [t-N] entries, not the raw
+            # message count (the "RECENT DECISIONS" header is not a turn).
+            history_turns = sum(
+                1 for m in messages
+                if isinstance(m, dict) and m.get("role") == "system"
+                and str(m.get("content", "")).startswith("[t-")
+            )
             self._log(
                 "prompt_forensics",
                 f"system={len(messages[0]['content'])}c"
-                f" history_turns={len(middle)}"
+                f" history_turns={history_turns}"
                 f" history={sum(len(m['content']) for m in middle)}c"
                 f" memory={len(messages[-2]['content']) if len(messages) > 2 else 0}c"
                 f" state={state_chars}c"

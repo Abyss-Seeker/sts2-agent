@@ -8,6 +8,28 @@ import statistics
 from typing import Any
 
 
+def extract_reasoning_tokens(usage: Any) -> int:
+    """Unified reasoning-token extraction (§8): top-level preferred,
+    nested fallback, NEVER summed across aliases."""
+    if not isinstance(usage, dict):
+        return 0
+    top = usage.get("reasoning_tokens")
+    if top is not None:
+        try:
+            return int(top or 0)
+        except (TypeError, ValueError):
+            return 0
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict):
+        nested = details.get("reasoning_tokens")
+        if nested is not None:
+            try:
+                return int(nested or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 @dataclass
 class BenchmarkMetrics:
     benchmark_valid: bool = True
@@ -130,18 +152,8 @@ class BenchmarkMetrics:
             # smarter, or just slower?
             self.llm_calls_by_reasoning_effort[str(effort)] += 1
             if usage:
-                try:
-                    self.reasoning_tokens_by_effort[str(effort)] += int(
-                        usage.get("reasoning_tokens") or 0)
-                except (TypeError, ValueError):
-                    pass
-                details = usage.get("completion_tokens_details")
-                if isinstance(details, dict):
-                    try:
-                        self.reasoning_tokens_by_effort[str(effort)] += int(
-                            details.get("reasoning_tokens") or 0)
-                    except (TypeError, ValueError):
-                        pass
+                self.reasoning_tokens_by_effort[str(effort)] += (
+                    extract_reasoning_tokens(usage))
             if latency_ms is not None:
                 self.latency_ms_by_effort.setdefault(
                     str(effort), []).append(int(latency_ms))
@@ -159,18 +171,7 @@ class BenchmarkMetrics:
                         usage.get("completion_tokens") or 0)
                 except (TypeError, ValueError):
                     pass
-                details = usage.get("completion_tokens_details")
-                reasoning = int(
-                    usage.get("reasoning_tokens") or 0)
-                if isinstance(details, dict):
-                    try:
-                        reasoning += int(details.get("reasoning_tokens") or 0)
-                    except (TypeError, ValueError):
-                        pass
-                try:
-                    self.combat_reasoning_tokens += reasoning
-                except (TypeError, ValueError):
-                    pass
+                self.combat_reasoning_tokens += extract_reasoning_tokens(usage)
 
     def record_llm_failure(self) -> None:
         """One failed inference attempt (timeout / HTTP error / abandoned)."""
@@ -294,17 +295,10 @@ class BenchmarkMetrics:
 
         add("prompt_tokens", "prompt_tokens")
         add("completion_tokens", "completion_tokens")
-        add("reasoning_tokens", "reasoning_tokens")
         add("prompt_cache_hit_tokens", "prompt_cache_hit_tokens")
         add("prompt_cache_miss_tokens", "prompt_cache_miss_tokens")
-
-        # Compatibility with providers that nest details.
-        details = usage.get("completion_tokens_details")
-        if isinstance(details, dict):
-            try:
-                self.reasoning_tokens += int(details.get("reasoning_tokens") or 0)
-            except (TypeError, ValueError):
-                pass
+        # §8: top-level preferred, nested fallback, NEVER summed aliases.
+        self.reasoning_tokens += extract_reasoning_tokens(usage)
 
     @staticmethod
     def _percentile(values: list[int], p: float) -> float | None:

@@ -19,7 +19,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from agent import DEFAULT_CONFIG, AgentSession
+from agent import DEFAULT_CONFIG, AgentSession, migrate_prompt_config
+
+PROMPT_MIGRATION_WARNINGS: list[str] = []
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                cfg.update(saved)
+        except Exception:
+            pass
+    cfg, warnings = migrate_prompt_config(cfg)
+    if warnings:
+        PROMPT_MIGRATION_WARNINGS.extend(warnings)
+        for w in warnings:
+            print(f"[prompt-migration] {w}", flush=True)
+        save_config(cfg)  # persist the migrated schema
+    return cfg
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"

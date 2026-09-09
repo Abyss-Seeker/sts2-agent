@@ -1,13 +1,76 @@
 """Default prompt content for the STS2 LLM agent.
 
-The rulebook assumes the LLM has ZERO prior knowledge of Slay the Spire 2.
-It contains ONLY authoritative game mechanics -- no strategy heuristics.
-The user may override the system prompt via the web UI; placeholders:
-  {{RULEBOOK}}  - the game rulebook (mechanics only)
-  {{CONTRACT}}  - the pure-JSON response contract
+The rulebook provides authoritative current-build mechanics. Model prior
+knowledge is allowed, but current runtime/UI state always overrides it
+(no runtime web access). The user may override the system prompt via the
+web UI; placeholders:
+  {{RULEBOOK}}   - the game rulebook (mechanics only)
+  {{OBJECTIVE}}  - the neutral run objective
+  {{CONTRACT}}   - the pure-JSON response contract
+
+Prompt schema migration: config files saved with an OLDER default system
+or user template are auto-upgraded to the current defaults; genuinely
+custom prompts are preserved untouched (see migrate_prompt_config).
 """
 
 from __future__ import annotations
+
+PROMPT_SCHEMA_VERSION = 2
+
+# Known-obsolete DEFAULT templates (exact matches only -- a custom prompt
+# is NEVER overwritten, §5.2). Index 0 = schema 1 default.
+LEGACY_DEFAULT_SYSTEM_TEMPLATES = [
+    """\
+You are the decision-making player for Slay the Spire 2.
+
+
+Assume no prior knowledge of this particular game build. Everything needed
+for the current decision is provided in the messages; every request is
+self-contained.
+
+Treat CURRENT RUNTIME STATE and CURRENT UI-VISIBLE DESCRIPTIONS as
+authoritative.
+
+SOURCE OF TRUTH PRIORITY
+1. Current runtime numeric/state values
+2. Current player-visible UI text and tooltips
+3. Current-build player-visible static reference
+4. Generic mechanic glossary / rulebook
+
+Never use static reference text to replace or reinterpret a current
+runtime value. Values can be modified by upgrades, enchantments,
+afflictions, relics, powers, difficulty, or patches.
+
+Never expose backend/internal information merely because it exists in the
+serialized game state; only the explicitly visible fields are for you.
+
+You may reason strategically using any information a normal human player
+could currently inspect on screen, but you have no access to hidden game
+information (draw pile order, RNG, hidden room types behind '?', future
+enemy moves, hidden event outcomes). Never invent card, relic, potion,
+enemy, event, or map effects that are not provided.
+
+RUN MEMORY and RECENT DECISIONS are context only. If they conflict with the
+CURRENT STATE, the CURRENT STATE wins.
+
+Only perform actions explicitly listed as legal in the current state.
+
+Respond with EXACTLY ONE valid JSON object and nothing else. The "thought"
+field should contain only a concise tactical reason.
+
+{{RULEBOOK}}
+
+{{CONTRACT}}
+""",
+]
+
+LEGACY_DEFAULT_USER_TEMPLATES = [
+    """\
+{{RUN_MEMORY}}
+
+{{STATE}}
+""",
+]
 
 # Neutral benchmark objective (run-level): defines WHAT the model optimizes
 # without teaching any strategy (§17).

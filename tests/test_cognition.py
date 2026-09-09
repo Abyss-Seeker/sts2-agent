@@ -266,6 +266,120 @@ def test_reasoning_metrics_by_effort() -> None:
     print("PASS reasoning_metrics_by_effort")
 
 
+def test_reasoning_tokens_top_only() -> None:
+    from benchmark_metrics import extract_reasoning_tokens
+    assert extract_reasoning_tokens({"reasoning_tokens": 42}) == 42
+    print("PASS reasoning_tokens_top_only")
+
+
+def test_reasoning_tokens_nested_only() -> None:
+    from benchmark_metrics import extract_reasoning_tokens
+    usage = {"completion_tokens_details": {"reasoning_tokens": 7}}
+    assert extract_reasoning_tokens(usage) == 7
+    print("PASS reasoning_tokens_nested_only")
+
+
+def test_reasoning_tokens_not_double_counted() -> None:
+    from benchmark_metrics import extract_reasoning_tokens
+    # both_same: the alias pair must count ONCE.
+    both_same = {"reasoning_tokens": 10,
+                 "completion_tokens_details": {"reasoning_tokens": 10}}
+    assert extract_reasoning_tokens(both_same) == 10, both_same
+    # both_different: top-level preferred, never the sum.
+    both_diff = {"reasoning_tokens": 10,
+                 "completion_tokens_details": {"reasoning_tokens": 3}}
+    assert extract_reasoning_tokens(both_diff) == 10
+    assert extract_reasoning_tokens({}) == 0
+    m = BenchmarkMetrics()
+    m._add_usage(both_same)
+    assert m.reasoning_tokens == 10  # not 20
+    print("PASS reasoning_tokens_not_double_counted")
+
+
+def test_history_forensics_exact_turn_count() -> None:
+    s = AgentSession()
+    s._config["max_history_turns"] = 3
+    for i in range(3):
+        s._ctx.add_decision(f"S{i}", "R", "")
+    messages = s._ctx.build_messages("SYS", "MEM", "STATE")
+    s._log = lambda *a, **k: None
+    # count via the same rule the forensics uses
+    turns = sum(
+        1 for m in messages
+        if isinstance(m, dict) and m.get("role") == "system"
+        and str(m.get("content", "")).startswith("[t-")
+    )
+    assert turns == 3, turns
+    print("PASS history_forensics_exact_turn_count")
+
+
+def test_decision_attempts_not_squared() -> None:
+    """§3: the shared budget caps TOTAL logical decisions for one state
+    at decision_attempts, even when the outer chunk loop AND the inner
+    request loop would each like their full quota."""
+    s = make_session()
+    s._config["decision_attempts"] = 3
+    calls = {"n": 0}
+
+    class CountingLLM(_FakeLLM):
+        pass
+
+    # Use the real _request_combat_chunk against a fake llm whose chat
+    # always returns a chunk whose FIRST action is invalid (probe fails),
+    # forcing the outer loop to re-request: total logical calls must be
+    # capped at 3, not 9.
+    s._llm = _FakeLLM("generic")
+
+    def fake_chat(messages):
+        calls["n"] += 1
+        return json.dumps({
+            "thought": "bad",
+            "actions": [{"kind": "play", "card_ref": "h99",
+                         "target_ref": "e0"}],
+        })
+
+    s._llm.chat = fake_chat
+    s._llm.last_usage = {}
+    s._config["failure_policy"] = "benchmark_strict"
+    state = combat_state(
+        alive=True,
+        hand=[{"id": "STRIKE", "target": "AnyEnemy", "playable": True}],
+    )
+    s._handle_model_failure_orig = s._handle_model_failure
+    s._handle_model_failure = lambda st, reason: None  # capture, no stop
+    s._stop = type("E", (), {"is_set": lambda self: False, "set": lambda self: None, "wait": lambda self, t: False})()
+    s._client = None
+    # silence _execute (never reached: no valid action is sent)
+    s._execute = lambda act: "ok"
+    s._handle_combat_chunk_state(
+        state, s._llm, "SYS", hard_deadline=60.0, llm_call_cap=60.0,
+        reconcile_event=None,
+    )
+    assert calls["n"] <= 3, f"logical decisions squatted: {calls['n']}"
+    print(f"PASS decision_attempts_not_squared (calls={calls['n']})")
+
+
+def test_prompt_schema_migration() -> None:
+    import prompts as prompts_mod
+    from agent import migrate_prompt_config
+
+    # legacy default auto-upgrades
+    legacy = {"system_template": prompts_mod.LEGACY_DEFAULT_SYSTEM_TEMPLATES[0],
+              "user_template": prompts_mod.LEGACY_DEFAULT_USER_TEMPLATES[0]}
+    migrated, warns = migrate_prompt_config(legacy)
+    assert migrated["system_template"] == prompts_mod.DEFAULT_SYSTEM_TEMPLATE
+    assert migrated["prompt_schema_version"] == prompts_mod.PROMPT_SCHEMA_VERSION
+    assert warns, warns
+
+    # custom prompt preserved
+    custom = {"system_template": "MY CUSTOM PROMPT",
+              "user_template": "MY USER"}
+    kept, warns2 = migrate_prompt_config(custom)
+    assert kept["system_template"] == "MY CUSTOM PROMPT"
+    assert any("Custom system prompt" in w for w in warns2), warns2
+    print("PASS legacy_default_prompt_auto_migrates + custom_old_prompt_preserved")
+
+
 def run_all() -> None:
     tests = [
         test_fixed_effort_used,
@@ -282,6 +396,12 @@ def run_all() -> None:
         test_history_zero_and_three,
         test_current_state_never_soft_truncated,
         test_reasoning_metrics_by_effort,
+        test_reasoning_tokens_top_only,
+        test_reasoning_tokens_nested_only,
+        test_reasoning_tokens_not_double_counted,
+        test_history_forensics_exact_turn_count,
+        test_decision_attempts_not_squared,
+        test_prompt_schema_migration,
     ]
     for fn in tests:
         fn()
