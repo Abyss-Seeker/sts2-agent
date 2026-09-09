@@ -877,18 +877,22 @@ class AgentSession:
                 # whatever screen the new state shows -- confirmation
                 # semantics are identical in both modes:
                 #   SENT -> next authoritative state -> CONFIRMED / REJECTED.
-                if cfg.get("decision_mode") == "action_chunk":
-                    reconcile_event = None
-                    if self._plan_executor.inflight is not None:
-                        # The sent action must be confirmed/rejected,
-                        # checkpoint-logged and the plan finalized BEFORE
-                        # routing decides anything.
-                        reconcile_event = self._reconcile_inflight_if_any(state)
-                else:
-                    # single_action mode: the sent action's confirmation
-                    # also comes from the next authoritative state.
+                reconcile_event = None
+                if (
+                    cfg.get("decision_mode") == "action_chunk"
+                    and self._plan_executor.inflight is not None
+                ):
+                    # The sent plan action must be confirmed/rejected,
+                    # checkpoint-logged and the plan finalized BEFORE
+                    # routing decides anything.
+                    reconcile_event = self._reconcile_inflight_if_any(state)
+                # Single-action sends happen in BOTH modes (action_chunk
+                # uses the single path for every non-combat screen), so
+                # reconcile a pending single action whenever one exists --
+                # otherwise non-combat actions are never confirmed and a
+                # rejected option loops forever (found in real-game smoke).
+                if self._pending_single_action is not None:
                     self._reconcile_pending_single_action(state)
-                    reconcile_event = None
 
                 # Step B: route the newly observed screen.
                 stype = str(state.get("type", "unknown"))

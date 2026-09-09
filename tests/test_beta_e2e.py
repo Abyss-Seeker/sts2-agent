@@ -592,6 +592,69 @@ def test_strict_failure() -> None:
     print("PASS TEST 6 strict_failure")
 
 
+# ----------------------------------------------------------------
+# Real-smoke regression: in action_chunk mode, NON-COMBAT screens use
+# the single-action path -- their sends MUST still be reconciled against
+# the next authoritative state (bug found in the first real-game smoke:
+# sent=4 but confirmed=0, rejected choices looped until game timeout).
+# ----------------------------------------------------------------
+
+def event_state(request_id: str, label: str) -> dict:
+    return {
+        "type": "event",
+        "request_id": request_id,
+        "floor": 2, "act": 1,
+        "options": [{"index": 0, "label": label, "enabled": True}],
+    }
+
+
+def test_chunk_mode_noncombat_action_is_confirmed() -> None:
+    class LLM(MockLLM):
+        script = [
+            json.dumps({"thought": "leave", "action": "choose", "index": 0}),
+            json.dumps({"thought": "pick", "action": "choose", "index": 0}),
+        ]
+
+    s0 = event_state("r0", "Take the gold")
+    s1 = event_state("r1", "Different event body")  # visibly different
+
+    s, bridge = run_agent(9130, LLM, states=[s0, s1])
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    assert bridge.actions[0] == {"action": "choose", "index": 0}
+    assert st["game_action_sent_count"] >= 1, st
+    # The non-combat choose was CONFIRMED by the next authoritative state
+    # even though decision_mode is action_chunk.
+    assert st["game_action_confirmed_count"] >= 1, st
+    assert st["game_action_rejected_count"] == 0, st
+    print("PASS chunk_mode_noncombat_action_is_confirmed")
+
+
+def test_chunk_mode_noncombat_rejected_by_unchanged_state() -> None:
+    class LLM(MockLLM):
+        script = [
+            json.dumps({"thought": "leave", "action": "choose", "index": 0}),
+            json.dumps({"thought": "try again", "action": "choose", "index": 0}),
+        ]
+
+    s0 = event_state("r0", "Take the gold")
+    s1 = event_state("r1", "Take the gold")  # IDENTICAL visible state
+
+    s, bridge = run_agent(9131, LLM, states=[s0, s1])
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    # The re-emitted unchanged state means the game refused the option:
+    # rejected must be counted (no silent confirmation, no infinite loop
+    # without accounting).
+    assert st["game_action_rejected_count"] == 1, st
+    assert st["game_action_confirmed_count"] == 0, st
+    print("PASS chunk_mode_noncombat_rejected_by_unchanged_state")
+
+
 def run_all() -> None:
     tests = [
         test_one_plan_three_confirmed_actions,
@@ -603,6 +666,8 @@ def run_all() -> None:
         test_strict_failure,
         test_single_action_confirmed_by_next_state,
         test_single_action_rejected_by_unchanged_state,
+        test_chunk_mode_noncombat_action_is_confirmed,
+        test_chunk_mode_noncombat_rejected_by_unchanged_state,
     ]
     for fn in tests:
         fn()
