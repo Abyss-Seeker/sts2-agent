@@ -222,6 +222,13 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        # Provider effort mapping (§5): DeepSeek maps medium/xhigh -> high;
+        # unsupported providers get no field at all. The agent reads
+        # last_effective_reasoning_effort for the UI/forensics.
+        self.last_effective_reasoning_effort = "provider_default"
+        if payload.get("reasoning_effort"):
+            self.last_effective_reasoning_effort = str(
+                payload["reasoning_effort"])
 
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 2):

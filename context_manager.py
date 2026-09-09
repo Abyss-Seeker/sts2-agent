@@ -109,8 +109,13 @@ class ContextManager:
                 note=note,
             )
         )
-        if len(self.history) > self.config.max_history_turns * 3:
-            self.history = self.history[-self.config.max_history_turns * 3:]
+        limit = self.config.max_history_turns * 3
+        if limit <= 0:
+            # max_history_turns=0 disables history entirely (note: history
+            # slicing must not use [-0:], which is the WHOLE list).
+            self.history = []
+        elif len(self.history) > limit:
+            self.history = self.history[-limit:]
 
     def build_messages(
         self,

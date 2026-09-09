@@ -69,16 +69,6 @@
     </section>
 
     <section>
-      <h3>上下文管理</h3>
-      <div class="row">
-        <label>历史轮数 <input id="max_history_turns" type="number" min="0" max="24"></label>
-        <label>单状态上限 <input id="max_state_chars" type="number"></label>
-        <label>上下文预算 <input id="max_context_chars" type="number"></label>
-      </div>
-      <p class="hint">历史按预算从最旧开始裁剪；运行记忆（HP/金币/事件）始终保留，保证长局不丢失全局信息。</p>
-    </section>
-
-    <section>
       <h3>选项</h3>
       <label>思考显示
         <select id="show_thinking">
@@ -91,6 +81,89 @@
       <p class="hint">每个动作发送前的停顿，用于放慢节奏观察 LLM 表现；0 表示全速。</p>
       <label class="chk"><input id="disable_fallback" type="checkbox"> 禁用游戏端随机替打（推荐）</label>
       <label class="chk"><input id="save_log" type="checkbox"> 保存决策日志到 logs/</label>
+    </section>
+
+    <section>
+      <h3>🧠 Cognition / Context（认知与上下文）</h3>
+      <div class="row">
+        <label>思考
+          <select id="thinking_enabled">
+            <option value="true">开启</option>
+            <option value="false">关闭</option>
+          </select>
+        </label>
+        <label>流式
+          <select id="stream_mode">
+            <option value="off">off（默认，最稳）</option>
+            <option value="auto">auto</option>
+            <option value="on">on</option>
+          </select>
+        </label>
+      </div>
+      <label>Reasoning policy
+        <select id="reasoning_policy">
+          <option value="fixed">fixed（全局固定档位）</option>
+          <option value="adaptive">adaptive（按场景分档）</option>
+        </select>
+      </label>
+      <div class="row">
+        <label>Fixed effort
+          <select id="reasoning_effort_fixed">
+            <option value="low">low</option>
+            <option value="medium">medium*</option>
+            <option value="high">high</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <label>Combat entry
+          <select id="reasoning_effort_combat_entry">
+            <option value="low">low</option>
+            <option value="medium">medium*</option>
+            <option value="high">high</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Combat follow-up
+          <select id="reasoning_effort_combat_followup">
+            <option value="low">low</option>
+            <option value="medium">medium*</option>
+            <option value="high">high</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <label>Non-combat
+          <select id="reasoning_effort_noncombat">
+            <option value="low">low</option>
+            <option value="medium">medium*</option>
+            <option value="high">high</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>Retry
+          <select id="reasoning_effort_retry">
+            <option value="low">low</option>
+            <option value="medium">medium*</option>
+            <option value="high">high</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <label class="chk"><input type="checkbox" disabled> 仅 adaptive 生效</label>
+      </div>
+      <p class="hint">* DeepSeek 官方 Chat Completions 会把 medium 映射为 high（medium 不是独立档位）。combat entry=战斗首次 inspect；follow-up=同场战斗后续；retry=重试。默认 entry=high / follow-up=low / noncombat=high / retry=high。</p>
+      <h3>上下文</h3>
+      <div class="row">
+        <label>历史轮数 (0..24, 建议 2–4) <input id="max_history_turns" type="number" min="0" max="24"></label>
+        <label>单状态上限 <input id="max_state_chars" type="number"></label>
+      </div>
+      <div class="row">
+        <label>上下文预算 <input id="max_context_chars" type="number"></label>
+        <label>Max output tokens <input id="max_tokens" type="number"></label>
+      </div>
+      <p class="hint">历史只服务「刚才为什么 checkpoint / 上一个 plan」；当前局面永远完整发送不截断。</p>
     </section>
 
     <section>
@@ -108,30 +181,8 @@
         </select>
       </label>
       <div class="row">
-        <label>思考
-          <select id="thinking_enabled">
-            <option value="true">开启</option>
-            <option value="false">关闭</option>
-          </select>
-        </label>
-        <label>思考强度
-          <select id="reasoning_effort">
-            <option value="low">low</option>
-            <option value="high">high</option>
-            <option value="max">max</option>
-          </select>
-        </label>
-        <label>流式
-          <select id="stream_mode">
-            <option value="off">off（默认，最稳）</option>
-            <option value="auto">auto</option>
-            <option value="on">on</option>
-          </select>
-        </label>
-      </div>
-      <div class="row">
         <label>单计划动作上限 <input id="action_chunk_max_actions" type="number" min="1" max="32"></label>
-        <label class="chk"><input id="delta_observations" type="checkbox"> 检查点用增量观测</label>
+        <label class="chk"><input id="delta_observations" type="checkbox"> 检查点用增量观测（默认关）</label>
       </div>
       <p class="hint">action_chunk：一次模型推理可驱动多个逐个被桥接确认的战斗动作；出现新信息/动作失效时立即中断并向模型重新询问。strict 模式下 LLM 失败绝不代打。</p>
     </section>

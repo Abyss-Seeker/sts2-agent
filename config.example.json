@@ -11,7 +11,7 @@
   "decision_attempts": 3,
   "system_template": "{{RULEBOOK}}\n\n{{CONTRACT}}",
   "user_template": "{{RUN_MEMORY}}\n\n{{STATE}}\n",
-  "max_history_turns": 8,
+  "max_history_turns": 3,
   "max_state_chars": 4000,
   "max_context_chars": 24000,
   "disable_fallback": true,
@@ -29,7 +29,12 @@
   "action_chunk_max_actions": 16,
   "delta_observations": false,
   "thinking_enabled": true,
-  "reasoning_effort": "high",
+  "reasoning_policy": "fixed",
+  "reasoning_effort_fixed": "high",
+  "reasoning_effort_combat_entry": "high",
+  "reasoning_effort_combat_followup": "low",
+  "reasoning_effort_noncombat": "high",
+  "reasoning_effort_retry": "high",
   "stream_mode": "off",
   "provider_profile": "auto"
 }

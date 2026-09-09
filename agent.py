@@ -42,6 +42,7 @@ from prompts import (
     DEFAULT_SYSTEM_TEMPLATE,
     DEFAULT_USER_TEMPLATE,
     RULEBOOK,
+    RUN_OBJECTIVE,
     ACTION_CHUNK_CONTRACT,
     SINGLE_ACTION_CONTRACT,
 )
@@ -69,7 +70,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "decision_attempts": 3,
     "system_template": DEFAULT_SYSTEM_TEMPLATE,
     "user_template": DEFAULT_USER_TEMPLATE,
-    "max_history_turns": 8,
+    "max_history_turns": 3,
     "max_state_chars": 4000,
     "max_context_chars": 24000,
     "disable_fallback": True,
@@ -108,7 +109,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "delta_observations": False,
     # DeepSeek thinking controls (generic endpoints ignore them).
     "thinking_enabled": True,
-    "reasoning_effort": "high",  # low | high | max
+    # ---- Reasoning effort policy (user-controllable cognition) ----
+    # "fixed": one effort for every call (legacy `reasoning_effort`
+    # migrates to `reasoning_effort_fixed`). "adaptive": per-context
+    # class effort; all values come from config, never hard-coded.
+    "reasoning_policy": "fixed",          # fixed | adaptive
+    "reasoning_effort_fixed": "high",     # low | medium | high | max | xhigh
+    "reasoning_effort_combat_entry": "high",
+    "reasoning_effort_combat_followup": "low",
+    "reasoning_effort_noncombat": "high",
+    "reasoning_effort_retry": "high",
     "stream_mode": "off",        # off | auto | on
     # Provider capability profile: "auto" enables native DeepSeek fields
     # ONLY on the official api.deepseek.com hostname (never by model
@@ -131,6 +141,20 @@ def _looks_like_decision_object(obj: Any) -> bool:
             or isinstance(obj.get("actions"), list)
         )
     )
+
+
+def migrate_reasoning_config(user_config: dict[str, Any]) -> dict[str, Any]:
+    """Legacy migration (§3): a user config that only carries the old
+    ``reasoning_effort`` key (and no explicit ``reasoning_effort_fixed``)
+    maps it to ``reasoning_effort_fixed`` BEFORE the defaults merge, so
+    existing config.json files keep working verbatim."""
+    if not isinstance(user_config, dict):
+        return user_config
+    if user_config.get("reasoning_effort") and not user_config.get(
+            "reasoning_effort_fixed"):
+        user_config["reasoning_effort_fixed"] = str(
+            user_config["reasoning_effort"])
+    return user_config
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -513,6 +537,13 @@ class AgentSession:
         # semantics to ActionChunk reconciliation.
         self._pending_single_action: dict[str, Any] | None = None
         self._pending_single_before_state: dict[str, Any] | None = None
+        # Adaptive reasoning state
+        self._reasoning_context_class = ""
+        self._requested_reasoning_effort = ""
+        self._effective_reasoning_effort = ""
+        # Combat lifecycle identity: (floor, act) of the last combat
+        # inspection. First inspection for an identity = combat_entry.
+        self._combat_identity: tuple[int, int] | None = None
 
     # ---------------- logging ----------------
 
@@ -544,7 +575,10 @@ class AgentSession:
         with self._lock:
             if self._running:
                 raise RuntimeError("Agent already running")
-            self._config = {**DEFAULT_CONFIG, **(config or {})}
+            self._config = {
+                **DEFAULT_CONFIG,
+                **migrate_reasoning_config(dict(config or {})),
+            }
             # Normalize beta knobs to their allowed values.
             if self._config.get("decision_mode") not in ("single_action", "action_chunk"):
                 self._config["decision_mode"] = "single_action"
@@ -582,6 +616,12 @@ class AgentSession:
             self._last_model_failure_reason = ""
             self._pending_single_action = None
             self._pending_single_before_state = None
+            self._combat_identity = None
+            self._reasoning_context_class = ""
+            self._requested_reasoning_effort = ""
+            self._effective_reasoning_effort = ""
+            if self._config.get("reasoning_policy") not in ("fixed", "adaptive"):
+                self._config["reasoning_policy"] = "fixed"
             self._thread = threading.Thread(
                 target=self._run, name="llm-agent", daemon=True
             )
@@ -644,6 +684,12 @@ class AgentSession:
                 "llm_total_tokens": prompt_tokens + completion_tokens,
                 # ---- Beta: ActionChunk runtime status/metrics ----
                 "decision_mode": str(self._config.get("decision_mode", "single_action")),
+                # Adaptive reasoning observability (§11/45)
+                "reasoning_policy": str(self._config.get("reasoning_policy", "fixed")),
+                "reasoning_context_class": self._reasoning_context_class,
+                "requested_reasoning_effort": self._requested_reasoning_effort,
+                "effective_reasoning_effort": self._effective_reasoning_effort,
+                "reasoning_by_effort": dict(self._metrics.llm_calls_by_reasoning_effort),
                 "agent_phase": self._agent_phase,
                 "benchmark_valid": self._metrics.benchmark_valid,
                 "invalidation_reason": self._metrics.invalidation_reason,
@@ -903,11 +949,13 @@ class AgentSession:
         # ActionChunk contract in one model call.
         single_system_prompt = render_template(
             cfg["system_template"],
-            {"RULEBOOK": RULEBOOK, "CONTRACT": SINGLE_ACTION_CONTRACT},
+            {"RULEBOOK": RULEBOOK, "CONTRACT": SINGLE_ACTION_CONTRACT,
+             "OBJECTIVE": RUN_OBJECTIVE},
         )
         chunk_system_prompt = render_template(
             cfg["system_template"],
-            {"RULEBOOK": RULEBOOK, "CONTRACT": ACTION_CHUNK_CONTRACT},
+            {"RULEBOOK": RULEBOOK, "CONTRACT": ACTION_CHUNK_CONTRACT,
+             "OBJECTIVE": RUN_OBJECTIVE},
         )
         # Hard wall-clock budget for ONE DECISION, shared by all retry
         # attempts of the same state (see _handle_state).
@@ -1266,6 +1314,56 @@ class AgentSession:
         CheckpointReason.POTION_INVALID,
     }
 
+    # ---- Adaptive reasoning effort (user-controllable cognition) ----
+
+    _EFFORT_ALIASES = {"medium": "high", "xhigh": "high"}
+
+    def _resolve_reasoning(self, context_class: str, retry: bool = False):
+        """Resolve (context_class, requested, effective) effort for one
+        model call. All values come from config; nothing is hard-coded.
+        DeepSeek maps medium/xhigh to high; unsupported providers omit
+        the parameter entirely (effective = provider_default)."""
+        policy = str(self._config.get("reasoning_policy", "fixed"))
+        if retry:
+            context_class = "retry"
+        if policy == "adaptive":
+            key = "reasoning_effort_" + context_class
+            requested = str(self._config.get(key, "high"))
+        else:
+            context_class = "fixed"
+            requested = str(self._config.get("reasoning_effort_fixed",
+                                             self._config.get(
+                                                 "reasoning_effort", "high")))
+        requested = requested.lower()
+        llm = self._llm
+        caps_provider = getattr(getattr(llm, "caps", None), "provider", "")
+        if caps_provider == "deepseek":
+            effective = self._EFFORT_ALIASES.get(requested, requested)
+            if effective not in ("low", "high", "max"):
+                effective = "high"
+        else:
+            effective = (
+                "provider_default"
+                if not getattr(llm, "caps", None)
+                or not getattr(llm.caps, "supports_reasoning_effort", False)
+                else requested
+            )
+        self._reasoning_context_class = context_class
+        self._requested_reasoning_effort = requested
+        self._effective_reasoning_effort = effective
+        return context_class, requested, effective
+
+    def _apply_reasoning(self, context_class: str, retry: bool = False) -> str:
+        """Resolve the effort for THIS call and push it onto the client."""
+        cls, requested, effective = self._resolve_reasoning(
+            context_class, retry)
+        llm = self._llm
+        if llm is not None and effective not in (None, "provider_default"):
+            llm.reasoning_effort = effective
+        elif llm is not None:
+            llm.reasoning_effort = None  # omit unsupported parameter
+        return effective
+
     def _set_live(self, which: str, delta: str) -> None:
         with self._lock:
             if which == "reasoning":
@@ -1415,6 +1513,25 @@ class AgentSession:
         # One cognitive boundary per state that needs the model.
         self._combat_section = True
         self._metrics.record_inspection(combat=True)
+        # Combat entry vs follow-up: the FIRST inspection of a combat
+        # lifecycle (identified by floor+act, robust across resume) uses
+        # combat_entry effort; all later inspections in the same combat
+        # use combat_followup. Unknown identity after a process restart
+        # conservatively counts as combat_entry (legality unaffected).
+        try:
+            identity = (
+                int(state.get("floor", 0) or 0),
+                int(state.get("act", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            identity = (0, 0)
+        context_class = (
+            "combat_followup"
+            if self._combat_identity == identity
+            else "combat_entry"
+        )
+        self._combat_identity = identity
+        self._apply_reasoning(context_class)
         decision_deadline = time.monotonic() + hard_deadline
         try:
             attempts = max(1, int(self._config.get("decision_attempts", 3)))
@@ -1527,6 +1644,7 @@ class AgentSession:
             call_budget = min(remaining - send_margin, llm_call_cap)
             # (llm_request_count is recorded by llm.on_http_attempt --
             # one count per REAL HTTP attempt, retries included.)
+            self._log_prompt_forensics(messages)
             try:
                 t0 = time.monotonic()
                 raw_reply = self._chat_with_deadline(llm, messages, call_budget)
@@ -1578,6 +1696,7 @@ class AgentSession:
                 first_content_ms=getattr(llm, "first_content_ms", None),
                 usage=getattr(llm, "last_usage", None) or None,
                 combat=True,
+                effort=self._effective_reasoning_effort,
             )
             try:
                 parsed = extract_json(raw_reply)
@@ -1971,6 +2090,7 @@ class AgentSession:
         # One cognitive boundary per state that needs the model.
         self._combat_section = False
         self._metrics.record_inspection()
+        self._apply_reasoning("noncombat")
         feedback = ""
         prev_action_json = ""
         act: dict[str, Any] | None = None
@@ -2013,6 +2133,8 @@ class AgentSession:
             call_budget = min(remaining - send_margin, llm_call_cap)
             # (llm_request_count is recorded by llm.on_http_attempt --
             # one count per REAL HTTP attempt, retries included.)
+            self._apply_reasoning("noncombat", retry=(attempt > 1))
+            self._log_prompt_forensics(messages)
             try:
                 t0 = time.monotonic()
                 raw_reply = self._chat_with_deadline(llm, messages, call_budget)
@@ -2219,6 +2341,26 @@ class AgentSession:
             return "(已隐藏思考)"
         # Unknown mode fallback
         return raw_reply.strip()[:300] if raw_reply else "(fallback)"
+
+    def _log_prompt_forensics(self, messages: list) -> None:
+        """Prompt-size forensics (§44): one developer log line per LLM call
+        so slow/long calls can be attributed to context size vs effort."""
+        try:
+            state_chars = len(messages[-1]["content"]) if messages else 0
+            middle = messages[1:-2] if len(messages) > 3 else []
+            self._log(
+                "prompt_forensics",
+                f"system={len(messages[0]['content'])}c"
+                f" history_turns={len(middle)}"
+                f" history={sum(len(m['content']) for m in middle)}c"
+                f" memory={len(messages[-2]['content']) if len(messages) > 2 else 0}c"
+                f" state={state_chars}c"
+                f" policy={self._config.get('reasoning_policy')}"
+                f" class={self._reasoning_context_class}"
+                f" effort={self._effective_reasoning_effort}",
+            )
+        except Exception:
+            pass
 
     def _send_single_action(self, act: dict[str, Any], state: dict[str, Any]) -> str:
         """Single-action-mode send: this only proves ACTION SENT (never

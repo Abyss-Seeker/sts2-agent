@@ -68,6 +68,11 @@ class BenchmarkMetrics:
     strategic_recovery_count: int = 0
     transport_interrupted_action_count: int = 0
 
+    # ---- Reasoning-effort forensic statistics (per effective effort) ----
+    llm_calls_by_reasoning_effort: Counter = field(default_factory=Counter)
+    reasoning_tokens_by_effort: Counter = field(default_factory=Counter)
+    latency_ms_by_effort: dict[str, list[int]] = field(default_factory=dict)
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
     reasoning_tokens: int = 0
@@ -109,6 +114,7 @@ class BenchmarkMetrics:
         first_content_ms: int | None = None,
         usage: dict[str, Any] | None = None,
         combat: bool = False,
+        effort: str | None = None,
     ) -> None:
         self.llm_success_count += 1
         if latency_ms is not None:
@@ -119,6 +125,26 @@ class BenchmarkMetrics:
             self.first_content_token_ms.append(int(first_content_ms))
         if usage:
             self._add_usage(usage)
+        if effort:
+            # Per-effort forensic statistics (§12): is "high" actually
+            # smarter, or just slower?
+            self.llm_calls_by_reasoning_effort[str(effort)] += 1
+            if usage:
+                try:
+                    self.reasoning_tokens_by_effort[str(effort)] += int(
+                        usage.get("reasoning_tokens") or 0)
+                except (TypeError, ValueError):
+                    pass
+                details = usage.get("completion_tokens_details")
+                if isinstance(details, dict):
+                    try:
+                        self.reasoning_tokens_by_effort[str(effort)] += int(
+                            details.get("reasoning_tokens") or 0)
+                    except (TypeError, ValueError):
+                        pass
+            if latency_ms is not None:
+                self.latency_ms_by_effort.setdefault(
+                    str(effort), []).append(int(latency_ms))
         if combat:
             self.combat_llm_success_count += 1
             if latency_ms is not None:
@@ -394,4 +420,21 @@ class BenchmarkMetrics:
             "prompt_cache_miss_tokens": fresh,
             "cache_hit_ratio": (hit / cache_total if cache_total else None),
             "checkpoint_reasons": dict(self.checkpoint_reasons),
+            # Reasoning-effort forensics (§12)
+            "reasoning_by_effort": {
+                effort: {
+                    "calls": calls,
+                    "reasoning_tokens": self.reasoning_tokens_by_effort.get(
+                        effort, 0),
+                    "mean_reasoning_tokens": (
+                        self.reasoning_tokens_by_effort.get(effort, 0) / calls
+                        if calls else 0.0),
+                    "latency_ms_p50": self._percentile(
+                        self.latency_ms_by_effort.get(effort, []), 0.50),
+                    "latency_ms_p95": self._percentile(
+                        self.latency_ms_by_effort.get(effort, []), 0.95),
+                }
+                for effort, calls in sorted(
+                    self.llm_calls_by_reasoning_effort.items())
+            },
         }

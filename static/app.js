@@ -13,7 +13,13 @@ const NUM_FIELDS = [
   "action_chunk_max_actions",
 ];
 const TEXTAREA_FIELDS = ["system_template", "user_template"];
-const SELECT_FIELDS = ["show_thinking", "decision_mode", "failure_policy", "reasoning_effort", "stream_mode", "thinking_enabled"];
+const SELECT_FIELDS = [
+  "show_thinking", "decision_mode", "failure_policy",
+  "stream_mode", "thinking_enabled", "reasoning_policy",
+  "reasoning_effort_fixed", "reasoning_effort_combat_entry",
+  "reasoning_effort_combat_followup", "reasoning_effort_noncombat",
+  "reasoning_effort_retry",
+];
 const CHECK_FIELDS = ["disable_fallback", "save_log", "auto_launch_game", "delta_observations"];
 
 const DEFAULT_PROMPTS = null; // filled from server DEFAULT_CONFIG on load
