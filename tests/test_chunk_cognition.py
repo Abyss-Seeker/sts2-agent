@@ -101,9 +101,9 @@ class TestConfigDefaults(unittest.TestCase):
     def test_delta_default_false(self):
         self.assertIs(DEFAULT_CONFIG.get("delta_observations"), False)
 
-    def test_strict_failure_default(self):
+    def test_resilient_failure_default(self):
         self.assertEqual(DEFAULT_CONFIG.get("failure_policy"),
-                         "benchmark_strict")
+                         "demo_resilient")
 
     def test_thinking_default_true(self):
         self.assertIs(DEFAULT_CONFIG.get("thinking_enabled"), True)

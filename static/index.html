@@ -12,6 +12,7 @@
   <div id="status-chips">
     <span class="chip" id="chip-agent">Agent: 未知</span>
     <span class="chip" id="chip-bridge">桥接: 未知</span>
+    <span class="chip" id="chip-controller">控制器: 未知</span>
     <span class="chip" id="chip-state">界面: -</span>
     <span class="chip" id="chip-floor">楼层: -</span>
     <span class="chip" id="chip-hp">HP: -</span>
@@ -48,6 +49,13 @@
       <label>API Base URL <input id="api_base_url" type="text" placeholder="https://api.openai.com"></label>
       <label>API Key <input id="api_key" type="password" placeholder="sk-..."></label>
       <label>模型 <input id="model" type="text" placeholder="gpt-4o-mini"></label>
+      <label>Provider profile
+        <select id="provider_profile">
+          <option value="auto">auto（仅官方 DeepSeek 主机启用原生字段）</option>
+          <option value="generic">generic（标准 OpenAI 兼容）</option>
+          <option value="deepseek">deepseek（强制原生字段）</option>
+        </select>
+      </label>
       <div class="row">
         <label>Temperature <input id="temperature" type="number" step="0.1" min="0" max="2"></label>
         <label>Max Tokens <input id="max_tokens" type="number"></label>
@@ -56,7 +64,7 @@
         <label>超时(秒) <input id="llm_timeout" type="number" min="1" max="295"></label>
         <label>失败重试次数 <input id="llm_retries" type="number" min="0" max="3"></label>
       </div>
-      <p class="hint">兼容 OpenAI / DeepSeek / Moonshot / Qwen / Ollama / vLLM 等，Base URL 不带 /v1 时会自动补全。LLM 超时会被钳制到「游戏端等待窗口 − 5s」（另有 1s 硬性总时限余量）；重试会成倍占用窗口时间，默认 0——单次失败会用安全兜底动作继续游戏。慢速 reasoning 模型请同步调大"游戏端决策等待"。</p>
+      <p class="hint">兼容 OpenAI / DeepSeek / Moonshot / Qwen / Ollama / vLLM 等。仅裸域名会自动补 /v1；显式 /v2 或自定义路径会原样保留。auto 只按 api.deepseek.com 主机启用 DeepSeek 原生字段。LLM 超时受游戏端等待窗口限制；慢速 reasoning 模型请同步调大“游戏端决策等待”。</p>
     </section>
 
     <section>
@@ -163,7 +171,6 @@
       </div>
       <div class="row">
         <label>上下文预算 <input id="max_context_chars" type="number"></label>
-        <label>Max output tokens <input id="max_tokens" type="number"></label>
       </div>
       <p class="hint">历史只服务「刚才为什么 checkpoint / 上一个 plan」；当前局面永远完整发送不截断。</p>
     </section>
@@ -178,15 +185,15 @@
       </label>
       <label>失败策略
         <select id="failure_policy">
-          <option value="benchmark_strict">benchmark_strict（失败即终止，无兜底）</option>
           <option value="demo_resilient">demo_resilient（允许确定性兜底，benchmark 失效）</option>
+          <option value="benchmark_strict">benchmark_strict（失败即终止，无兜底）</option>
         </select>
       </label>
       <div class="row">
         <label>单计划动作上限 <input id="action_chunk_max_actions" type="number" min="1" max="32"></label>
         <label class="chk"><input id="delta_observations" type="checkbox"> 检查点用增量观测（默认关）</label>
       </div>
-      <p class="hint">action_chunk：一次模型推理可驱动多个逐个被桥接确认的战斗动作；出现新信息/动作失效时立即中断并向模型重新询问。strict 模式下 LLM 失败绝不代打。</p>
+      <p class="hint">action_chunk：一次模型推理可驱动多个逐个被桥接确认的战斗动作；出现新信息/动作失效时立即中断并向模型重新询问。交互游玩默认 resilient；strict 仅适合不允许任何兜底的评测。</p>
     </section>
 
     <button id="btn-save" class="primary wide">💾 保存配置</button>

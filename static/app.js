@@ -15,7 +15,7 @@ const NUM_FIELDS = [
 const TEXTAREA_FIELDS = ["system_template", "user_template"];
 const SELECT_FIELDS = [
   "show_thinking", "decision_mode", "failure_policy",
-  "stream_mode", "thinking_enabled", "reasoning_policy",
+  "stream_mode", "provider_profile", "thinking_enabled", "reasoning_policy",
   "reasoning_effort_fixed", "reasoning_effort_combat_entry",
   "reasoning_effort_combat_followup", "reasoning_effort_noncombat",
   "reasoning_effort_retry",
@@ -98,6 +98,10 @@ function renderStatus(st) {
   const chipBridge = $("chip-bridge");
   chipBridge.textContent = "桥接: " + (st.bridge_connected ? "已连接" : "未连接");
   chipBridge.className = "chip " + (st.bridge_connected ? "ok" : "bad");
+  const chipController = $("chip-controller");
+  const controllerKnown = st.automation_active !== null && st.automation_active !== undefined;
+  chipController.textContent = "控制器: " + (controllerKnown ? (st.automation_active ? "运行中" : "已停止") : "未知");
+  chipController.className = "chip " + (controllerKnown ? (st.automation_active ? "ok" : "bad") : "warn");
   const chipState = $("chip-state");
   chipState.textContent = "界面: " + (st.current_state_type || "-");
   chipState.className = "chip " + (st.current_state_type ? "warn" : "");
@@ -116,7 +120,7 @@ function renderStatus(st) {
     const ratio = st.actions_per_llm_call ? Number(st.actions_per_llm_call).toFixed(1) : "0";
     $("chip-metrics").textContent =
       `调用/动作: ${st.llm_request_count ?? 0}/${st.game_action_count ?? 0} (${ratio}/次)` +
-      (st.benchmark_valid === false ? " · 已失效" : "");
+      (st.benchmark_valid === false ? " · 已使用恢复/兜底" : "");
     $("chip-metrics").className = "chip " + (st.benchmark_valid === false ? "bad" : "");
   }
   $("btn-start").disabled = st.running;
@@ -134,7 +138,8 @@ function renderLogs(logs) {
       (e.llm_ms ? ` · LLM ${(e.llm_ms / 1000).toFixed(1)}s` : "");
     let html = `<div class="meta"><span class="tag">${KIND_LABEL[e.kind] || e.kind}</span>${escapeHtml(meta)}</div>`;
     html += `<div>${escapeHtml(e.text || "")}</div>`;
-    if (e.action) html += `<div class="action">➤ ${escapeHtml(e.action)} ${e.result ? "— " + escapeHtml(e.result) : ""}</div>`;
+    const renderedAction = e.action || e.actions;
+    if (renderedAction) html += `<div class="action">➤ ${escapeHtml(renderedAction)} ${e.result ? "— " + escapeHtml(e.result) : ""}</div>`;
     div.innerHTML = html;
     feed.prepend(div);
     while (feed.children.length > 200) feed.removeChild(feed.lastChild);

@@ -27,7 +27,7 @@
   "resume_wait_seconds": 600,
   "dump_raw_responses": true,
   "decision_mode": "action_chunk",
-  "failure_policy": "benchmark_strict",
+  "failure_policy": "demo_resilient",
   "action_chunk_max_actions": 8,
   "delta_observations": false,
   "thinking_enabled": true,

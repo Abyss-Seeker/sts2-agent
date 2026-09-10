@@ -131,10 +131,12 @@ def snapshot_runs(session: AgentSession) -> dict[str, dict]:
 
 def _git_head() -> str:
     try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-            timeout=5, cwd=str(Path(__file__).resolve().parent),
+        repo = str(Path(__file__).resolve().parent)
+        head = subprocess.run(
+            ["git", "-c", f"safe.directory={repo}", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, cwd=repo,
         ).stdout.strip()
+        return head or "unknown"
     except Exception:
         return "unknown"
 

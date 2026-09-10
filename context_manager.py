@@ -109,7 +109,10 @@ class ContextManager:
                 note=note,
             )
         )
-        limit = self.config.max_history_turns * 3
+        # The setting is a turn limit, not a hidden multiplier.  Keeping
+        # three times the advertised amount made long runs steadily drag
+        # stale tactical context into unrelated decisions.
+        limit = self.config.max_history_turns
         if limit <= 0:
             # max_history_turns=0 disables history entirely (note: history
             # slicing must not use [-0:], which is the WHOLE list).

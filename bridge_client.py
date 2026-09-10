@@ -118,6 +118,7 @@ class STS2GameClient:
         self._buffer: bytes = b""
         self._connected: bool = False
         self._last_request_id: str | None = None
+        self._automation_active: bool | None = None
 
     # ----------------------------------------------------------------
     # Connection management
@@ -166,6 +167,10 @@ class STS2GameClient:
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def automation_active(self) -> bool | None:
+        return self._automation_active
+
     # ----------------------------------------------------------------
     # Message I/O
     # ----------------------------------------------------------------
@@ -188,6 +193,8 @@ class STS2GameClient:
                 # Ack messages are NOT game states -- treating them as such
                 # makes the agent answer them and desync the game flow.
                 logger.debug("Received ack: %s", msg_type)
+                if "automation_active" in data:
+                    self._automation_active = bool(data["automation_active"])
                 continue
             elif msg_type == MSG_TYPE_ERROR:
                 # ERROR SEMANTICS (verified against BridgeServer.cs): the
@@ -309,9 +316,13 @@ class STS2GameClient:
             "enabled": bool(enabled),
         })
 
+    def resume_automation(self) -> None:
+        """Ensure the mod controller loop is active and resumes its save."""
+        self.send_action({"action": "resume_automation"})
+
     def ping(self) -> bool:
         try:
-            self.send_action({"type": "PING"})
+            self.send_action({"action": BridgeAction.PING})
             return True
         except ConnectionError:
             return False

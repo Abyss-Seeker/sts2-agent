@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -28,7 +29,7 @@ import llm_client as llm_client_mod
 from agent import _looks_like_decision_object, extract_json
 from benchmark_metrics import BenchmarkMetrics
 from deepseek_provider_reference import build_chat_payload
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMError
 
 
 # ----------------------------------------------------------------
@@ -83,6 +84,18 @@ def test_explicit_profiles_override():
     assert forced_deepseek.caps.provider == "deepseek"
     assert _payload(forced_deepseek)["thinking"] == {"type": "enabled"}
     print("PASS FIX 6c explicit_profiles_override")
+
+
+def test_explicit_provider_path_is_preserved():
+    bare = LLMClient(base_url="https://example.test", api_key="k", model="m")
+    assert bare.endpoint == "https://example.test/v1/chat/completions"
+    v2 = LLMClient(base_url="https://example.test/v2", api_key="k", model="m")
+    assert v2.endpoint == "https://example.test/v2/chat/completions"
+    custom = LLMClient(base_url="https://example.test/openai/deployments/x",
+                       api_key="k", model="m")
+    assert custom.endpoint.endswith("/openai/deployments/x/chat/completions")
+    assert "/v2/v1/" not in v2.endpoint
+    print("PASS provider_explicit_path_preserved")
 
 
 # ----------------------------------------------------------------
@@ -183,6 +196,47 @@ def test_streaming_first_token_and_usage_metrics() -> None:
     finally:
         srv.shutdown()
     print("PASS FIX 8 streaming_first_token_and_usage_metrics")
+
+
+class _SlowSSEHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b'data: {"choices":[{"delta":{"content":"{"}}]}\n\n')
+        self.wfile.flush()
+        time.sleep(0.7)
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except OSError:
+            pass
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def test_streaming_total_deadline_closes_slow_response() -> None:
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _SlowSSEHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        llm = LLMClient(
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}",
+            api_key="k", model="m", stream_mode="on", timeout=5,
+        )
+        started = time.monotonic()
+        try:
+            llm.chat([{"role": "user", "content": "hi"}],
+                     deadline_seconds=0.15)
+            raise AssertionError("slow stream should exceed total deadline")
+        except LLMError:
+            pass
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.6, elapsed
+    finally:
+        srv.shutdown()
+    print("PASS streaming_total_deadline_closes_slow_response")
 
 
 # ----------------------------------------------------------------
@@ -349,8 +403,10 @@ def run_all() -> None:
         test_generic_relay_with_deepseek_model_name_gets_no_native_fields,
         test_official_deepseek_hostname_gets_native_fields,
         test_explicit_profiles_override,
+        test_explicit_provider_path_is_preserved,
         test_extract_json_repairs_chunk,
         test_streaming_first_token_and_usage_metrics,
+        test_streaming_total_deadline_closes_slow_response,
         test_metrics_sent_confirmed_rejected_and_requests,
         test_internal_http_retry_counted,
         test_stale_last_usage_not_reused,

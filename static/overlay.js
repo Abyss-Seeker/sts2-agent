@@ -53,8 +53,9 @@
           "</div>";
       }
       html += '<div class="e-thought">' + escapeHtml(e.text || "") + "</div>";
-      if (e.action) {
-        html += '<div class="e-action">➤ ' + escapeHtml(e.action);
+      var renderedAction = e.action || e.actions;
+      if (renderedAction) {
+        html += '<div class="e-action">➤ ' + escapeHtml(renderedAction);
         if (e.result) html += ' <span class="e-res">— ' + escapeHtml(e.result) + "</span>";
         html += "</div>";
       }

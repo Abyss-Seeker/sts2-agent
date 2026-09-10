@@ -61,11 +61,10 @@ server.py + static/     # 本地 Web UI（配置 API/模板、观测决策日志
 模型显式 `checkpoint_after:true`、屏幕切换。
 
 ### benchmark 纯度（`failure_policy`）
-- `benchmark_strict`（默认）：LLM 失败（API 错误/超时/全部解析失败）时
+- `demo_resilient`（默认）：允许确定性兜底动作继续演示，并清楚记录
+  `FALLBACK` 事件；评测有效性指标仍会标记该次兜底。
+- `benchmark_strict`：LLM 失败（API 错误/超时/全部解析失败）时
   **不做任何非 LLM 策略兜底**——标记 benchmark 失效并停止 Agent。
-- `demo_resilient`：允许确定性兜底动作继续演示，但立即记录
-  `NON-LLM FALLBACK USED — benchmark invalidated`，该局结果不作为
-  LLM 成绩。
 
 ### 指标
 严格区分四个维度（`/api/status`），且 **single_action 与 action_chunk

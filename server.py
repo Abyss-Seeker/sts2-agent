@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -23,29 +24,10 @@ from agent import DEFAULT_CONFIG, AgentSession, migrate_prompt_config
 
 PROMPT_MIGRATION_WARNINGS: list[str] = []
 
-
-def load_config() -> dict:
-    cfg = dict(DEFAULT_CONFIG)
-    if CONFIG_PATH.exists():
-        try:
-            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            if isinstance(saved, dict):
-                cfg.update(saved)
-        except Exception:
-            pass
-    cfg, warnings = migrate_prompt_config(cfg)
-    if warnings:
-        PROMPT_MIGRATION_WARNINGS.extend(warnings)
-        for w in warnings:
-            print(f"[prompt-migration] {w}", flush=True)
-        save_config(cfg)  # persist the migrated schema
-    return cfg
-
+logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 CONFIG_PATH = BASE_DIR / "config.json"
-
-session = AgentSession()
 _config_lock = threading.Lock()
 
 
@@ -56,9 +38,17 @@ def load_config() -> dict:
             saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(saved, dict):
                 cfg.update(saved)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Could not read %s: %s", CONFIG_PATH, e)
+    cfg, warnings = migrate_prompt_config(cfg)
+    if warnings:
+        PROMPT_MIGRATION_WARNINGS.extend(warnings)
+        for w in warnings:
+            print(f"[prompt-migration] {w}", flush=True)
+        save_config(cfg)  # persist the migrated schema
     return cfg
+
+session = AgentSession()
 
 
 def save_config(cfg: dict) -> None:
@@ -67,8 +57,8 @@ def save_config(cfg: dict) -> None:
             CONFIG_PATH.write_text(
                 json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Could not save %s: %s", CONFIG_PATH, e)
 
 
 class Handler(BaseHTTPRequestHandler):

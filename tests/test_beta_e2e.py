@@ -257,7 +257,8 @@ class FakeBridge(threading.Thread):
                     # bridge_client auto-attaches the state's request_id;
                     # strip it so assertions stay on the action payload.
                     a.pop("request_id", None)
-                    if str(a.get("action", "")).startswith("set_"):
+                    if (str(a.get("action", "")).startswith("set_")
+                            or a.get("action") == "resume_automation"):
                         continue
                     self.actions.append(a)
                     break
@@ -937,7 +938,10 @@ def test_strict_failure() -> None:
     s0 = combat_state("r0", energy=3,
                       hand=[card("STRIKE", target="AnyEnemy"), card("DEFEND")])
 
-    s, bridge = run_agent(9125, LLM, states=[s0])
+    s, bridge = run_agent(
+        9125, LLM, states=[s0],
+        cfg={"failure_policy": "benchmark_strict"},
+    )
     wait_until(lambda: not s.status()["running"], timeout=20)
     time.sleep(0.3)
     st = s.status()

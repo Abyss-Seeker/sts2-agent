@@ -99,6 +99,56 @@ class TestSelectionClassification(unittest.TestCase):
         self.assertEqual(s._metrics.game_action_rejected_count, 0)
         self.assertEqual(s._last_checkpoint_reason, "SELECTION_REQUIRED")
 
+    def test_correlated_rejection_outranks_selection_shape(self):
+        s = AgentSession()
+        s._metrics = BenchmarkMetrics()
+        s._logs = []
+        s._pending_single_action = {"action": "play", "card_index": 0}
+        s._pending_single_before_state = combat_state(
+            "B", energy=3, hand=[card("HEADBUTT", target="AnyEnemy")])
+        s._pending_action_request_id = "B"
+        rejected = selection_state("S1")
+        rejected["previous_action_result"] = {
+            "request_id": "B", "accepted": False, "reason": "refused"}
+        s._reconcile_pending_single_action(rejected)
+        self.assertEqual(s._metrics.game_action_confirmed_count, 0)
+        self.assertEqual(s._metrics.game_action_rejected_count, 1)
+
+    def test_combat_selection_uses_followup_reasoning(self):
+        class Caps:
+            provider = "deepseek"
+            supports_reasoning_effort = True
+
+        class LLM:
+            caps = Caps()
+            reasoning_effort = None
+            last_reasoning = ""
+            last_usage = {}
+            first_reasoning_ms = None
+            first_content_ms = None
+
+            def chat(self, messages):
+                return '{"thought":"upgrade the attack","action":"choose","index":0}'
+
+        s = AgentSession()
+        s._metrics = BenchmarkMetrics()
+        s._logs = []
+        s._send_single_action = lambda act, state: "sent"
+        state = selection_state("SEL")
+        state["combat_context"] = {
+            "in_combat": True,
+            "player": {"hp": 70, "energy": 1},
+            "hand": [],
+            "enemies": [],
+        }
+        llm = LLM()
+        s._llm = llm
+        s._handle_state(state, llm, "SYS", 10.0, 5.0)
+        self.assertEqual(s._reasoning_context_class, "combat_followup")
+        self.assertEqual(llm.reasoning_effort, "low")
+        self.assertEqual(s._metrics.combat_logical_inspection_count, 1)
+        self.assertEqual(s._metrics.combat_llm_success_count, 1)
+
 
 class TestAwaitingAdvanceLifecycle(unittest.TestCase):
     """P0: accepted-but-not-yet-observably-advanced is a WAITING state.

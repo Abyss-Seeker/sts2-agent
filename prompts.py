@@ -174,7 +174,7 @@ final boss of the last act.
 - If the attacker is WEAK (n), each hit deals 25% less damage.
 - If the defender is VULNERABLE (n), it takes 50% more attack damage.
 - STRENGTH (n) adds n damage to each attack hit; DEXTERITY (n) adds n Block
-  to each card that grants Block.
+  to each card that grants Block. 
 - FRAIL (n): the affected creature gains 25% less Block from cards.
 
 ## Cards

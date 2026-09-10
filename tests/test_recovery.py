@@ -183,6 +183,7 @@ class _FakeClient:
     def __init__(self, **k):
         self.fallback_calls: list[bool] = []
         self.timeout_calls: list[int] = []
+        self.resume_calls = 0
 
     def connect(self, should_abort=None):
         return
@@ -196,6 +197,15 @@ class _FakeClient:
     def set_agent_timeout(self, seconds: int):
         self.timeout_calls.append(seconds)
 
+    def set_headful(self, enabled: bool):
+        pass
+
+    def set_fast_mode(self, enabled: bool):
+        pass
+
+    def resume_automation(self):
+        self.resume_calls += 1
+
 
 def test_recoverable_terminated_reconnects_existing_game() -> None:
     gl, state, original = _install_fake_game_launcher(missing_game=False)
@@ -207,7 +217,11 @@ def test_recoverable_terminated_reconnects_existing_game() -> None:
         state_before = (s._memory.floor, s._run_id)
         assert s._recover_interrupted_run({"type": "game_over"}) is True
         assert s._metrics.bridge_reconnect_count == 1
-        assert s._metrics.safe_recovery_count >= 1
+        # TCP reconnect is not yet a validated gameplay recovery. The main
+        # loop records success only after a new authoritative state arrives.
+        assert s._metrics.safe_recovery_count == 0
+        assert s._recovery_pending_validation is True
+        assert s._client.resume_calls == 1
         assert s._metrics.game_relaunch_count == 0  # game was still running
         assert s._memory.floor == state_before[0]  # run context preserved
         assert s._run_id == state_before[1]
@@ -246,6 +260,7 @@ def test_recovery_reapplies_bridge_settings() -> None:
         client = s._client
         assert client.fallback_calls == [False], client.fallback_calls
         assert client.timeout_calls == [120], client.timeout_calls
+        assert client.resume_calls == 1
     finally:
         gl.is_game_running, gl.launch_via_steam = original
     print("PASS recovery_reapplies_bridge_settings")

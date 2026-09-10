@@ -2,7 +2,8 @@
 
 Works with any provider exposing ``POST {base_url}/chat/completions``
 (OpenAI, DeepSeek, Moonshot, Qwen/DashScope compatible mode, vLLM, Ollama,
-OpenRouter, ...). ``base_url`` may be given with or without a trailing ``/v1``.
+OpenRouter, ...). A bare origin gets ``/v1``; explicit provider paths such as
+``/v2`` or deployment routes are preserved.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import json
 import logging
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from deepseek_provider_reference import (
@@ -73,8 +75,11 @@ class LLMClient:
             # User provided the full endpoint -- use it verbatim.
             self.endpoint = self.base_url
         else:
-            if self.base_url and not self.base_url.endswith("/v1"):
-                # Common convention: providers serve under /v1.
+            parsed_base = urllib.parse.urlsplit(self.base_url)
+            # Add the conventional /v1 only when the user supplied a bare
+            # origin.  An explicit path such as /v2 or /openai/deployments/x
+            # is authoritative and must never become the invalid /v2/v1.
+            if self.base_url and parsed_base.path.rstrip("/") == "":
                 self.base_url += "/v1"
             self.endpoint = self.base_url + "/chat/completions"
         self.api_key = api_key or ""
@@ -195,7 +200,42 @@ class LLMClient:
             except Exception:
                 pass
 
-    def chat(self, messages: list[dict[str, str]]) -> str:
+    @staticmethod
+    def _remaining(deadline_at: float) -> float:
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("LLM request exceeded its total deadline")
+        return remaining
+
+    @staticmethod
+    def _set_response_timeout(resp: object, timeout: float) -> None:
+        """Best-effort update of urllib's underlying socket timeout.
+
+        ``urlopen(timeout=...)`` is an operation timeout, not a total call
+        deadline. Refreshing it with the remaining budget before every read
+        prevents a slow stream/body from living past the decision window.
+        """
+        try:
+            sock = resp.fp.raw._sock  # type: ignore[attr-defined]
+            sock.settimeout(max(0.001, timeout))
+        except (AttributeError, OSError):
+            pass
+
+    def _read_body(self, resp: object, deadline_at: float) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            remaining = self._remaining(deadline_at)
+            self._set_response_timeout(resp, remaining)
+            chunk = resp.read(64 * 1024)  # type: ignore[attr-defined]
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        deadline_seconds: float | None = None,
+    ) -> str:
         """Send a chat completion request; returns the assistant text."""
         # Per-call metadata reset: a provider reply without usage/reasoning
         # must never let the PREVIOUS call's data leak into accounting.
@@ -207,6 +247,12 @@ class LLMClient:
         self._call_start = time.monotonic()
         self.first_reasoning_ms = None
         self.first_content_ms = None
+        total_budget = self.timeout
+        if deadline_seconds is None:
+            deadline_seconds = getattr(self, "_deadline_override", None)
+        if deadline_seconds is not None:
+            total_budget = min(total_budget, max(0.001, float(deadline_seconds)))
+        deadline_at = time.monotonic() + total_budget
         use_stream = self._should_stream()
         payload = build_chat_payload(
             model=self.model,
@@ -240,7 +286,7 @@ class LLMClient:
                     self.endpoint, data=body, headers=headers, method="POST"
                 )
                 if use_stream:
-                    text = self._chat_streaming(payload)
+                    text = self._chat_streaming(payload, deadline_at)
                     self._dump_raw(
                         json.dumps({
                             "streamed": True,
@@ -249,8 +295,10 @@ class LLMClient:
                         text,
                     )
                     return text
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    raw_body = resp.read()
+                with urllib.request.urlopen(
+                    req, timeout=self._remaining(deadline_at)
+                ) as resp:
+                    raw_body = self._read_body(resp, deadline_at)
                 data = json.loads(raw_body.decode("utf-8"))
                 # Record reasoning/finish_reason FIRST so that even a
                 # recoverable "thinking only" reply is fully described.
@@ -273,10 +321,17 @@ class LLMClient:
             except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
                 last_err = LLMError(f"LLM API request failed: {e}")
             if attempt <= self.max_retries:
-                time.sleep(min(2 ** attempt, 8))
+                delay = min(2 ** attempt, 8)
+                try:
+                    remaining = self._remaining(deadline_at)
+                except TimeoutError:
+                    break
+                if remaining <= delay:
+                    break
+                time.sleep(delay)
         raise last_err or LLMError("LLM API request failed")
 
-    def _chat_streaming(self, payload: dict) -> str:
+    def _chat_streaming(self, payload: dict, deadline_at: float) -> str:
         """Streaming chat completion (SSE). Reasoning/content deltas are
         accumulated and only the COMPLETE content is returned -- partial
         JSON is never parsed or acted upon."""
@@ -288,31 +343,42 @@ class LLMClient:
             self.endpoint, data=body, headers=headers, method="POST"
         )
         acc = StreamAccumulator()
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            for event in parse_sse_data_lines(resp):
-                r_delta, c_delta = acc.feed_event(event)
-                if r_delta:
-                    # Write the first-token timestamp ONCE, based on the
-                    # real call-start monotonic timestamp.
-                    if self.first_reasoning_ms is None:
-                        self.first_reasoning_ms = int(
-                            (time.monotonic() - self._call_start) * 1000
-                        )
-                    if self.on_reasoning_delta is not None:
-                        try:
-                            self.on_reasoning_delta(r_delta)
-                        except Exception:
-                            pass
-                if c_delta:
-                    if self.first_content_ms is None:
-                        self.first_content_ms = int(
-                            (time.monotonic() - self._call_start) * 1000
-                        )
-                    if self.on_content_delta is not None:
-                        try:
-                            self.on_content_delta(c_delta)
-                        except Exception:
-                            pass
+        with urllib.request.urlopen(
+            req, timeout=self._remaining(deadline_at)
+        ) as resp:
+            while True:
+                remaining = self._remaining(deadline_at)
+                self._set_response_timeout(resp, remaining)
+                raw_line = resp.readline()
+                if not raw_line:
+                    break
+                if raw_line.strip() == b"data: [DONE]":
+                    break
+                events = parse_sse_data_lines([raw_line])
+                for event in events:
+                    r_delta, c_delta = acc.feed_event(event)
+                    if r_delta:
+                        # Write the first-token timestamp ONCE, based on the
+                        # real call-start monotonic timestamp.
+                        if self.first_reasoning_ms is None:
+                            self.first_reasoning_ms = int(
+                                (time.monotonic() - self._call_start) * 1000
+                            )
+                        if self.on_reasoning_delta is not None:
+                            try:
+                                self.on_reasoning_delta(r_delta)
+                            except Exception:
+                                pass
+                    if c_delta:
+                        if self.first_content_ms is None:
+                            self.first_content_ms = int(
+                                (time.monotonic() - self._call_start) * 1000
+                            )
+                        if self.on_content_delta is not None:
+                            try:
+                                self.on_content_delta(c_delta)
+                            except Exception:
+                                pass
         self.last_reasoning = acc.reasoning
         self.last_finish_reason = acc.finish_reason
         if isinstance(acc.usage, dict):

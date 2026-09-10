@@ -10,13 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import queue
 import re
 import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from action_plan import ActionChunk, PlanParseError, parse_action_chunk
 from benchmark_metrics import BenchmarkMetrics
@@ -29,8 +30,8 @@ SELECTION_SCREEN_TYPES = frozenset({"card_select"})
 # declares a protocol stall instead of looping forever.
 PROTOCOL_STALL_REPEATS = 3
 
-# SENT != ACCEPTED. The strings produced by _execute() ("played card 0",
-# "ended turn", ...) only describe what was HANDED TO THE SOCKET; they are
+# SENT != ACCEPTED. The strings produced by _execute() explicitly describe
+# what was handed to the socket; they are
 # logging/diagnostics and are NEVER the source of truth for acceptance. The
 # authoritative game-side outcome arrives as the next state's
 # ``previous_action_result`` metadata and is resolved by
@@ -130,7 +131,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # failure the benchmark is invalidated and the agent stops) or
     # "demo_resilient" (deterministic fallback may play; benchmark
     # invalidated and prominently logged).
-    "failure_policy": "benchmark_strict",
+    "failure_policy": "demo_resilient",
     # Ceiling (not target) for one ActionChunk: enough to cover a full
     # turn without encouraging abnormally long plans.
     "action_chunk_max_actions": 8,
@@ -272,6 +273,41 @@ def extract_json(text: str) -> dict[str, Any]:
             return obj
     except json.JSONDecodeError:
         pass
+    # Dependency-free repair for the most common model slip: a comma before
+    # a closing object/array delimiter. Track JSON strings so text such as
+    # `",}"` is never rewritten.
+    repaired_chars: list[str] = []
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(cleaned):
+        if in_string:
+            repaired_chars.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            repaired_chars.append(ch)
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < len(cleaned) and cleaned[j].isspace():
+                j += 1
+            if j < len(cleaned) and cleaned[j] in "}]":
+                continue
+        repaired_chars.append(ch)
+    repaired = "".join(repaired_chars)
+    if repaired != cleaned:
+        try:
+            obj = json.loads(repaired)
+            if _looks_like_decision_object(obj):
+                return obj
+        except json.JSONDecodeError:
+            pass
     match = re.search(r"\{.*\}", cleaned, re.S)
     if match:
         try:
@@ -318,6 +354,39 @@ def extract_json(text: str) -> dict[str, Any]:
                     return obj
             except json.JSONDecodeError:
                 pass
+            # Relay truncation often drops only the final `]}`. Close a
+            # syntactically complete prefix without guessing any values.
+            stack: list[str] = []
+            in_candidate_string = False
+            candidate_escaped = False
+            for ch in candidate:
+                if in_candidate_string:
+                    if candidate_escaped:
+                        candidate_escaped = False
+                    elif ch == "\\":
+                        candidate_escaped = True
+                    elif ch == '"':
+                        in_candidate_string = False
+                    continue
+                if ch == '"':
+                    in_candidate_string = True
+                elif ch in "{[":
+                    stack.append(ch)
+                elif ch == "}" and stack and stack[-1] == "{":
+                    stack.pop()
+                elif ch == "]" and stack and stack[-1] == "[":
+                    stack.pop()
+            if stack and not in_candidate_string:
+                closed_candidate = candidate + "".join(
+                    "}" if opener == "{" else "]"
+                    for opener in reversed(stack)
+                )
+                try:
+                    obj = json.loads(closed_candidate)
+                    if _looks_like_decision_object(obj):
+                        return obj
+                except json.JSONDecodeError:
+                    pass
             try:
                 from json_repair import repair_json
 
@@ -666,6 +735,7 @@ class AgentSession:
         # Combat lifecycle identity: (floor, act) of the last combat
         # inspection. First inspection for an identity = combat_entry.
         self._combat_identity: tuple[int, int] | None = None
+        self._recovery_pending_validation = False
 
     # ---------------- logging ----------------
 
@@ -674,7 +744,7 @@ class AgentSession:
             self._log_seq += 1
             entry = {
                 "seq": self._log_seq,
-                "ts": time.strftime("%H:%M:%S"),
+                "ts": datetime.now().strftime("%H:%M:%S.%f")[:-3],
                 "kind": kind,
                 "text": text,
             }
@@ -715,7 +785,7 @@ class AgentSession:
             if self._config.get("decision_mode") not in ("single_action", "action_chunk"):
                 self._config["decision_mode"] = "single_action"
             if self._config.get("failure_policy") not in ("benchmark_strict", "demo_resilient"):
-                self._config["failure_policy"] = "benchmark_strict"
+                self._config["failure_policy"] = "demo_resilient"
             if self._config.get("stream_mode") not in ("off", "auto", "on"):
                 self._config["stream_mode"] = "off"
             if self._config.get("reasoning_effort") not in ("low", "high", "max"):
@@ -767,6 +837,7 @@ class AgentSession:
             self._pending_action_request_id = ""
             self._run_baseline_snapshot = self._metrics.checkpoint()
             self._combat_identity = None
+            self._recovery_pending_validation = False
             self._reasoning_context_class = ""
             self._requested_reasoning_effort = ""
             self._effective_reasoning_effort = ""
@@ -804,6 +875,8 @@ class AgentSession:
             return {
                 "running": self._running,
                 "bridge_connected": self._bridge_connected,
+                "automation_active": getattr(
+                    self._client, "automation_active", None),
                 "decision_count": self._decision_count,
                 "current_state_type": self._current_state_type,
                 "last_error": self._last_error,
@@ -1080,6 +1153,16 @@ class AgentSession:
             except ConnectionError as e:
                 self._fail(f"Lost bridge while requesting start_run: {e}")
                 return
+        else:
+            try:
+                # Also acts as the controller-health handshake. If the mod
+                # auto-start raced ahead and its loop already terminated,
+                # this resumes the saved run instead of merely showing a
+                # healthy TCP socket.
+                self._client.resume_automation()
+            except ConnectionError as e:
+                self._fail(f"Lost bridge while checking controller health: {e}")
+                return
 
         self._memory = RunMemory()
         self._ctx = ContextManager(
@@ -1181,6 +1264,16 @@ class AgentSession:
                 if str(state.get("type")) == "start_run_ack":
                     self._handle_start_run_ack(state)
                     continue
+
+                if (self._recovery_pending_validation
+                        and state.get("type") not in {
+                            "run_complete", "game_over", "ok", "error", "pong"}):
+                    self._recovery_pending_validation = False
+                    self._metrics.record_safe_recovery()
+                    self._log(
+                        "info",
+                        "同一存档恢复已由新的权威游戏状态确认。",
+                    )
 
                 # Step A: ALWAYS reconcile previously-sent actions FIRST,
                 # whatever screen the new state shows -- confirmation
@@ -1408,6 +1501,7 @@ class AgentSession:
             )
         )
         self._run_id = uuid.uuid4().hex[:12]
+        self._combat_identity = None
         # Per-run metric slice baseline (§22): the runner's run_report
         # snapshot must be a per-run DELTA, not the cumulative counter.
         self._run_baseline_snapshot = self._metrics.checkpoint()
@@ -1434,8 +1528,6 @@ class AgentSession:
         if not self._config.get("auto_resume", True):
             return False
 
-        if same_run:
-            self._metrics.record_safe_recovery()
         self._clear_stale_transport_state()
 
         if not same_run:
@@ -1533,7 +1625,15 @@ class AgentSession:
                     bool(self._config.get("fast_mode", True)))
             except Exception:
                 pass
-            self._metrics.record_safe_recovery()
+            try:
+                # TCP reconnection alone does not restart a failed AutoSlayer
+                # loop. Ask the bridge to resume the authoritative save and
+                # defer the "safe recovery" metric until a real state arrives.
+                self._client.resume_automation()
+                self._recovery_pending_validation = True
+            except Exception as e:
+                self._log("error", f"恢复 automation 失败: {e}")
+                return False
             return True
 
         if self._stop.is_set():
@@ -1666,6 +1766,26 @@ class AgentSession:
         """P8/P9: developer-only one-line config summary + suspicious-config
         warnings. NEVER logs api_key."""
         cfg = self._config
+        raw_base = str(cfg.get("api_base_url") or "")
+        parsed_base = urlsplit(raw_base)
+        endpoint_path = parsed_base.path.rstrip("/") or "/v1"
+        if not endpoint_path.endswith("/chat/completions"):
+            endpoint_path += "/chat/completions"
+        endpoint_host = parsed_base.hostname or "?"
+        try:
+            parsed_port = parsed_base.port
+        except ValueError:
+            parsed_port = None
+        if parsed_port is not None:
+            endpoint_host += f":{parsed_port}"
+        requested_profile = str(cfg.get("provider_profile", "auto"))
+        resolved_profile = requested_profile
+        if requested_profile == "auto":
+            resolved_profile = (
+                "deepseek"
+                if (parsed_base.hostname or "").lower() == "api.deepseek.com"
+                else "generic"
+            )
         self._log(
             "info",
             "CONFIG AUDIT:"
@@ -1683,6 +1803,13 @@ class AgentSession:
             f" failure_policy={cfg.get('failure_policy')}"
             f" headful={cfg.get('headful_native_ui')}"
             f" fast={cfg.get('fast_mode')}"
+            f" endpoint={endpoint_host}{endpoint_path}"
+            f" model={cfg.get('model')}"
+            f" provider={requested_profile}->{resolved_profile}"
+            f" stream={cfg.get('stream_mode')}"
+            f" llm_timeout={cfg.get('llm_timeout')}"
+            f" agent_timeout={cfg.get('agent_timeout')}"
+            f" max_tokens={cfg.get('max_tokens')}"
             f" llm_retries={cfg.get('llm_retries')}",
         )
         # Suspicious-config warnings (informational, never auto-overridden).
@@ -1825,7 +1952,17 @@ class AgentSession:
         # selection (Headbutt discard pick, potion pick, ...). That is a
         # valid advancement -- NEVER classify it as ACTION_REJECTED just
         # because the underlying combat snapshot has not moved yet.
-        if stype in SELECTION_SCREEN_TYPES:
+        if (
+            event.checkpoint is not None
+            and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
+        ):
+            # A correlated explicit rejection is authoritative even if a
+            # selection-shaped state happens to arrive alongside it.
+            self._metrics.record_action_rejected()
+            self._no_advance_streak = 0
+            self._no_advance_key = None
+            self._on_action_rejected(state)
+        elif stype in SELECTION_SCREEN_TYPES:
             self._last_checkpoint_reason = "SELECTION_REQUIRED"
             self._log(
                 "info",
@@ -1847,14 +1984,6 @@ class AgentSession:
                 else CheckpointReason.AWAITING_ADVANCE
             )
             self._on_no_advance(state, reason)
-        elif (
-            event.checkpoint is not None
-            and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
-        ):
-            self._metrics.record_action_rejected()
-            self._no_advance_streak = 0
-            self._no_advance_key = None
-            self._on_action_rejected(state)
         else:
             self._metrics.record_action_confirmed(from_plan=True, combat=True)
             self._reject_streak = 0
@@ -2464,7 +2593,7 @@ class AgentSession:
         benchmark and stop. demo_resilient: the deterministic fallback may
         execute, but the benchmark is invalidated and prominently logged.
         """
-        if self._config.get("failure_policy", "benchmark_strict") == "benchmark_strict":
+        if self._config.get("failure_policy", "demo_resilient") == "benchmark_strict":
             self._metrics.invalidate(reason)
             self._agent_phase = "failed"
             self._log("benchmark_invalidated", reason)
@@ -2479,7 +2608,11 @@ class AgentSession:
         result = self._send_single_action(act, state)
         self._metrics.record_fallback(reason)
         self._decision_count += 1
-        self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
+        self._log(
+            "warning",
+            "FALLBACK: LLM decision failed; a deterministic recovery action"
+            " was sent and is awaiting game confirmation.",
+        )
         self._log(
             "decision",
             "(LLM 请求失败，demo 兜底动作，benchmark 已失效)",
@@ -2496,37 +2629,31 @@ class AgentSession:
     def _chat_with_deadline(
         self, llm: LLMClient, messages: list[dict[str, str]], deadline: float
     ) -> str:
-        """Run llm.chat under a HARD wall-clock deadline.
+        """Run one cancellable HTTP call under a total wall-clock budget.
 
-        urlopen's timeout only bounds individual socket operations: a slowly
-        streaming response can exceed it (observed 32.5s with timeout=25),
-        which blows the game's 30s decision window and aborts the run. So run
-        the call in a worker thread and abandon it at the deadline, falling
-        back to the safe action instead.
+        The client enforces the deadline on connect and every body/stream
+        read.  Calling it synchronously is deliberate: an expired request is
+        closed before another attempt can begin, so no orphan inference can
+        keep consuming quota or race a later decision.
         """
-        out: queue.Queue = queue.Queue()
-
-        def worker() -> None:
-            try:
-                out.put(llm.chat(messages))
-            except BaseException as e:  # propagate to the main thread
-                out.put(e)
-            finally:
-                with self._lock:
-                    self._llm_inflight = max(0, self._llm_inflight - 1)
-
         with self._lock:
             self._llm_inflight += 1
-        threading.Thread(target=worker, name="llm-call", daemon=True).start()
+        previous_override = getattr(llm, "_deadline_override", None)
+        llm._deadline_override = deadline
         try:
-            result = out.get(timeout=deadline)
-        except queue.Empty:
-            raise LLMError(
-                f"LLM 硬性时限 {deadline:.0f}s 超时（响应过慢/流式拖长）"
-            )
-        if isinstance(result, BaseException):
-            raise result
-        return result
+            # Keep the long-standing one-argument chat contract for custom
+            # clients/tests. LLMClient consumes the temporary override.
+            return llm.chat(messages)
+        finally:
+            if previous_override is None:
+                try:
+                    delattr(llm, "_deadline_override")
+                except AttributeError:
+                    pass
+            else:
+                llm._deadline_override = previous_override
+            with self._lock:
+                self._llm_inflight = max(0, self._llm_inflight - 1)
 
     @staticmethod
     def _has_thought(
@@ -2615,9 +2742,15 @@ class AgentSession:
             except Exception:
                 pass
 
+        selection_label = (
+            f", selection {state.get('selection_id')}"
+            if state.get("selection_id") else ""
+        )
         self._log(
             "state",
-            f"收到状态: {stype} (Floor {state.get('floor', '?')})，请求 LLM 决策中...",
+            f"收到状态: {stype} (Floor {state.get('floor', '?')}"
+            f"{selection_label})，请求 LLM 决策中...",
+            selection_id=str(state.get("selection_id") or ""),
         )
 
         user_template = self._config["user_template"]
@@ -2630,10 +2763,18 @@ class AgentSession:
         # state. Retries use whatever time is left; they can never push the
         # total decision past the game's window.
         decision_deadline = time.monotonic() + hard_deadline
-        # One cognitive boundary per state that needs the model.
-        self._combat_section = False
-        self._metrics.record_inspection()
-        self._apply_reasoning("noncombat")
+        # A native selection opened by a combat command is still combat
+        # cognition.  The bridge includes the authoritative combat context;
+        # do not downgrade Armaments/Headbutt-style follow-ups to noncombat.
+        combat_selection = (
+            stype == BridgeStateType.CARD_SELECT
+            and isinstance(state.get("combat_context"), dict)
+            and bool(state["combat_context"].get("in_combat"))
+        )
+        reasoning_context = "combat_followup" if combat_selection else "noncombat"
+        self._combat_section = combat_selection
+        self._metrics.record_inspection(combat=combat_selection)
+        self._apply_reasoning(reasoning_context)
         feedback = ""
         prev_action_json = ""
         act: dict[str, Any] | None = None
@@ -2676,7 +2817,7 @@ class AgentSession:
             call_budget = min(remaining - send_margin, llm_call_cap)
             # (llm_request_count is recorded by llm.on_http_attempt --
             # one count per REAL HTTP attempt, retries included.)
-            self._apply_reasoning("noncombat", retry=(attempt > 1))
+            self._apply_reasoning(reasoning_context, retry=(attempt > 1))
             self._log_prompt_forensics(messages)
             try:
                 t0 = time.monotonic()
@@ -2727,7 +2868,7 @@ class AgentSession:
             except LLMError as e:
                 self._metrics.record_llm_failure()
                 # Strict benchmark mode: NO fallback, invalidate + stop.
-                if self._config.get("failure_policy", "benchmark_strict") == "benchmark_strict":
+                if self._config.get("failure_policy", "demo_resilient") == "benchmark_strict":
                     self._handle_model_failure(state, f"LLM API error: {e}")
                     return
                 # Don't kill the run for one API failure: play the safe
@@ -2744,7 +2885,11 @@ class AgentSession:
                 act = self._fallback_action(state)
                 result_note = self._send_single_action(act, state)
                 self._metrics.record_fallback(f"LLM API error: {e}")
-                self._log("error", "NON-LLM FALLBACK USED — benchmark invalidated")
+                self._log(
+                    "warning",
+                    "FALLBACK: LLM API failed; a deterministic recovery action"
+                    " was sent and is awaiting game confirmation.",
+                )
                 self._decision_count += 1
                 self._log(
                     "decision",
@@ -2765,6 +2910,8 @@ class AgentSession:
                 first_reasoning_ms=getattr(llm, "first_reasoning_ms", None),
                 first_content_ms=getattr(llm, "first_content_ms", None),
                 usage=getattr(llm, "last_usage", None) or None,
+                combat=self._combat_section,
+                effort=self._effective_reasoning_effort,
             )
             try:
                 parsed = extract_json(raw_reply)
@@ -2798,7 +2945,7 @@ class AgentSession:
             break
 
         if act is None:
-            if self._config.get("failure_policy", "benchmark_strict") == "benchmark_strict":
+            if self._config.get("failure_policy", "demo_resilient") == "benchmark_strict":
                 self._handle_model_failure(state, "all decision attempts failed")
                 return
             act = self._fallback_action(state)
@@ -2829,6 +2976,7 @@ class AgentSession:
             result=result_note,
             state_type=stype,
             llm_ms=llm_ms,
+            selection_id=str(state.get("selection_id") or ""),
         )
         self._ctx.add_decision(state_text, json.dumps(act), result_note)
 
@@ -2975,20 +3123,25 @@ class AgentSession:
             self._pending_single_action = None
             self._pending_single_before_state = None
             return False
+        acceptance = self._resolve_action_acceptance(state)
+        if acceptance is ActionAcceptance.REJECTED:
+            # Correlated explicit rejection outranks every heuristic,
+            # including a coincident selection-shaped state.
+            self._pending_single_action = None
+            self._pending_single_before_state = None
+            self._metrics.record_action_rejected()
+            self._no_advance_streak = 0
+            self._no_advance_key = None
+            self._on_action_rejected(state)
+            return False
         fp_before = self._visible_state_fingerprint(before)
         fp_after = self._visible_state_fingerprint(state)
         if fp_before is None or fp_after is None or not fp_before or not fp_after:
-            # Conservative: never silently claim a confirmation. Clear the
-            # pending action (it cannot be reconciled reliably).
-            self._pending_single_action = None
-            self._pending_single_before_state = None
-            self._metrics.record_action_unconfirmable()
-            self._log(
-                "warning",
-                "UNKNOWN_CONFIRMATION: 无法可靠比较动作前后的可见状态，"
-                "该动作既不计为 confirmed 也不计为 rejected。",
-            )
-            return False
+            # Formatting failure is not permission to forget the command
+            # and ask for another one. Retain it and use the same bounded
+            # no-advance guard as any other unverifiable ACK.
+            self._on_no_advance(state, CheckpointReason.ADVANCE_UNVERIFIED)
+            return True
         if str(state.get("type", "")) in SELECTION_SCREEN_TYPES:
             # §11/§27-B: single-action mode -- the action opened a native
             # modal selection; valid advancement, never "unchanged".
@@ -3001,18 +3154,6 @@ class AgentSession:
             self._no_advance_key = None
             return False
         if fp_before == fp_after:
-            acceptance = self._resolve_action_acceptance(state)
-            if acceptance is ActionAcceptance.REJECTED:
-                # Authoritative REJECTION: the game refused the command and
-                # the state is unchanged. Clear the pending action so fresh
-                # cognition is permitted.
-                self._pending_single_action = None
-                self._pending_single_before_state = None
-                self._metrics.record_action_rejected()
-                self._no_advance_streak = 0
-                self._no_advance_key = None
-                self._on_action_rejected(state)
-                return False
             # ACCEPTED (or UNKNOWN/unverifiable): NOT a rejection. RETAIN the
             # pending action and wait for the next authoritative state --
             # never re-prompt, never "poke" the state with a resource.
@@ -3044,22 +3185,22 @@ class AgentSession:
         try:
             if name == BridgeAction.PLAY:
                 self._client.play_card(act["card_index"], act.get("target_index", -1))
-                return f"played card {act['card_index']} (target {act.get('target_index', -1)})"
+                return f"SENT play card {act['card_index']} (target {act.get('target_index', -1)})"
             if name == BridgeAction.END_TURN:
                 self._client.end_turn()
-                return "ended turn"
+                return "SENT end_turn"
             if name == BridgeAction.POTION:
                 self._client.use_potion(act["slot"], act.get("target_index", -1))
-                return f"used potion slot {act['slot']}"
+                return f"SENT potion slot {act['slot']}"
             if name == BridgeAction.CHOOSE:
                 if "indexes" in act:
                     self._client.choose_many(act["indexes"])
-                    return f"chose {act['indexes']}"
+                    return f"SENT choose {act['indexes']}"
                 self._client.choose(act["index"])
-                return f"chose {act['index']}"
+                return f"SENT choose {act['index']}"
             if name == BridgeAction.SKIP:
                 self._client.skip()
-                return "skipped"
+                return "SENT skip"
             return f"unknown action {name!r}"
         except ConnectionError as e:
             self._fail(f"Lost bridge while sending action: {e}")
