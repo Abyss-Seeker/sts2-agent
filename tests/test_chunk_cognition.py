@@ -295,6 +295,22 @@ class TestCheckpointDiscipline(unittest.TestCase):
                 for cp in reasons if cp is not None),
             f"expected HAND_CHANGED, got {reasons}")
 
+    def test_block_change_does_not_checkpoint(self):
+        """§36: gaining block (a normal combat-state advance) must not cause
+        a checkpoint -- the plan continues exactly like enemy-hp/energy do."""
+        ex, s0 = self._executor_with_plan()
+        ex.mark_sent(ex.prepare_next(s0, agent_mod.validate_action).prepared,
+                     s0)
+        # Block went 0 -> 12 (e.g. a Defend resolved before this observe),
+        # but it is a plain authoritative-state change, not new information.
+        s1 = combat_state("S1", energy=2, hand=[
+            card("DEFEND"), card("BASH", target="AnyEnemy")],
+            enemies=[cultist(30)], block=12, discard_count=1)
+        event, next_event = self._accept(ex, s1)
+        self.assertIsNotNone(next_event)
+        self.assertEqual(next_event.status, ExecutorStatus.READY_ACTION,
+                         next_event.checkpoint)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

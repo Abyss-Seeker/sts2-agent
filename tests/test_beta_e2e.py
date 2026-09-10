@@ -473,7 +473,11 @@ def test_rejected_action_no_replay() -> None:
     # confirming state never arrived (fake bridge closes).
     assert st["game_action_sent_count"] == 2, st
     assert st["game_action_confirmed_count"] == 0, st
-    assert st["game_action_rejected_count"] == 1, st
+    # §27 three-way classification: the bridge ACCEPTED the play
+    # ("played card 0") but the authoritative snapshot never advanced, so
+    # it is ACCEPTED-but-no-advance -> UNCONFIRMABLE, not REJECTED.
+    # Never counted as confirmed; never replayed.
+    assert st["game_action_unconfirmable_count"] >= 1, st
     assert st["last_checkpoint_reason"] == "ACTION_REJECTED", st
     print("PASS TEST 5 rejected_action_no_replay")
 
@@ -562,12 +566,16 @@ def test_single_action_rejected_by_unchanged_state() -> None:
                                  "target_index": 0}
     assert bridge.actions[-1] == {"action": "end_turn"}, bridge.actions
     assert st["llm_request_count"] == 2, st
-    # First action: sent == 1, confirmed == 0, rejected == 1. (The second
-    # re-prompted end_turn was sent too but its confirming state never
-    # arrived -- the fake bridge closes -- so it stays unconfirmed.)
+    # §27 three-way classification for the first action: the bridge ACCEPTED
+    # the play ("played card 0") but the authoritative snapshot never advanced
+    # (s1 is human-visibly identical to s0), so it is ACCEPTED-but-no-advance
+    # -> UNCONFIRMABLE, never REJECTED. (The second re-prompted end_turn was
+    # sent too but its confirming state never arrived -- the fake bridge
+    # closes -- so it also stays unconfirmable.)
     assert st["game_action_sent_count"] == 2, st
     assert st["game_action_confirmed_count"] == 0, st
-    assert st["game_action_rejected_count"] == 1, st
+    assert st["game_action_rejected_count"] == 0, st
+    assert st["game_action_unconfirmable_count"] >= 1, st
     print("PASS single_action_rejected_by_unchanged_state")
 
 
@@ -655,10 +663,13 @@ def test_chunk_mode_noncombat_rejected_by_unchanged_state() -> None:
     time.sleep(0.3)
     st = s.status()
 
-    # The re-emitted unchanged state means the game refused the option:
-    # rejected must be counted (no silent confirmation, no infinite loop
-    # without accounting).
-    assert st["game_action_rejected_count"] == 1, st
+    # §27 three-way classification: the bridge ACCEPTED the choose
+    # ("chose ...") but the authoritative event snapshot never advanced (s1 is
+    # human-visibly identical to s0), so it is ACCEPTED-but-no-advance ->
+    # UNCONFIRMABLE, never REJECTED (no silent confirmation, no infinite
+    # retry loop without accounting).
+    assert st["game_action_rejected_count"] == 0, st
+    assert st["game_action_unconfirmable_count"] >= 1, st
     assert st["game_action_confirmed_count"] == 0, st
     print("PASS chunk_mode_noncombat_rejected_by_unchanged_state")
 

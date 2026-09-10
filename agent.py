@@ -29,6 +29,22 @@ SELECTION_SCREEN_TYPES = frozenset({"card_select"})
 # declares a protocol stall instead of looping forever.
 PROTOCOL_STALL_REPEATS = 3
 
+# Bridge result strings that mean "the command was really taken by the
+# game" (§27-B): if the authoritative snapshot has not advanced yet, the
+# action is ACCEPTED-but-pending, never REJECTED.
+_ACCEPTED_RESULT_MARKERS = (
+    "ended turn", "played card", "used potion", "chose",
+    "used", "played", "selected",
+)
+
+
+def _bridge_accepted(result: str) -> bool:
+    r = str(result or "").strip().lower()
+    if not r or r.startswith("error") or "refused" in r \
+            or "cannot" in r or "invalid" in r:
+        return False
+    return any(m in r for m in _ACCEPTED_RESULT_MARKERS)
+
 from bridge_client import (
     BridgeAction,
     BridgeStateType,
@@ -634,9 +650,15 @@ class AgentSession:
         # (requested vs actual). NEVER part of the LLM observation.
         self._seed_requested: str = ""
         self._seed_ack: dict[str, Any] | None = None
-        # §25 PROTOCOL_STALL guard: consecutive identical rejections.
+        # §25 PROTOCOL_STALL guard: consecutive identical rejections, and
+        # the separate "command accepted but the world did not advance"
+        # streak (never the same thing -- see §27).
         self._reject_streak = 0
         self._reject_streak_key: tuple | None = None
+        self._no_advance_streak = 0
+        self._no_advance_key: tuple | None = None
+        # Bridge result string of the action currently in flight.
+        self._pending_action_result: str = ""
         # Adaptive reasoning state
         self._reasoning_context_class = ""
         self._requested_reasoning_effort = ""
@@ -739,6 +761,9 @@ class AgentSession:
             self._seed_ack = None
             self._reject_streak = 0
             self._reject_streak_key = None
+            self._no_advance_streak = 0
+            self._no_advance_key = None
+            self._pending_action_result = ""
             self._run_baseline_snapshot = self._metrics.checkpoint()
             self._combat_identity = None
             self._reasoning_context_class = ""
@@ -1764,13 +1789,49 @@ class AgentSession:
             event.checkpoint is not None
             and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
         ):
-            self._metrics.record_action_rejected()
-            self._on_action_rejected(state)
+            if _bridge_accepted(self._pending_action_result):
+                # §27-B: accepted but the world has not advanced yet.
+                self._on_no_advance(state)
+            else:
+                self._metrics.record_action_rejected()
+                self._on_action_rejected(state)
         else:
             self._metrics.record_action_confirmed(from_plan=True, combat=True)
             self._reject_streak = 0
         self._consume_executor_event(event, state)
         return event
+
+    def _on_no_advance(self, state: dict[str, Any]) -> None:
+        """§27-B: the command was accepted but the visible world did not
+        advance. Counted as unconfirmable (never confirmed, never
+        rejected) and bounded: repeating on the same state means the
+        bridge/game lifecycle is stuck (modal/animation/desync)."""
+        self._metrics.record_action_unconfirmable()
+        self._log(
+            "warning",
+            "ACTION_ACCEPTED_NO_ADVANCE: 命令已被游戏接受但权威状态未推进"
+            f"（result={self._pending_action_result!r}）——可能因回合切换/"
+            "动画/模态 UI；不计为 confirmed 也不计为 rejected。",
+        )
+        fp = self._visible_state_fingerprint(state) or "?"
+        key = (fp, str(self._pending_single_action))
+        if key == self._no_advance_key:
+            self._no_advance_streak += 1
+        else:
+            self._no_advance_key = key
+            self._no_advance_streak = 1
+        if self._no_advance_streak >= PROTOCOL_STALL_REPEATS:
+            self._log(
+                "error",
+                f"PROTOCOL_STALL: 同一权威状态连续 {self._no_advance_streak}"
+                " 次接受命令但世界未推进（疑似模态 UI / bridge lifecycle"
+                " desync）— 停止，不再让模型消耗游戏资源试探。",
+            )
+            self._metrics.invalidate(
+                "PROTOCOL_STALL: accepted command, world never advanced")
+            self._log("benchmark_invalidated",
+                      "PROTOCOL_STALL (no advance)")
+            self._stop.set()
 
     def _on_action_rejected(self, state: dict[str, Any]) -> None:
         """§25/§26: PROTOCOL_STALL guard -- the same action rejected by the
@@ -2156,6 +2217,7 @@ class AgentSession:
           when the authoritative next state arrives.
         """
         result = self._execute(prepared.bridge_action)
+        self._pending_action_result = str(result)
         if str(result).startswith("ERROR"):
             # _execute already failed the session on connection loss; the
             # executor must NOT be marked inflight (no phantom action) and
@@ -2747,6 +2809,7 @@ class AgentSession:
             snapshot = dict(state)
         self._pending_single_action = act
         self._pending_single_before_state = snapshot
+        self._pending_action_result = str(result)
         return result
 
     def _visible_state_fingerprint(self, state: dict[str, Any]) -> str | None:
@@ -2799,6 +2862,14 @@ class AgentSession:
             self._metrics.record_action_confirmed(from_plan=False)
             self._reject_streak = 0
         elif fp_before == fp_after:
+            if _bridge_accepted(self._pending_action_result):
+                # §27-B: the bridge ACCEPTED the command ("ended turn",
+                # "played card N", ...) but the authoritative snapshot has
+                # not advanced yet (turn switch / animation / modal). That
+                # is NOT a rejection -- do not count it as one and do not
+                # let the model "poke" the state with a resource.
+                self._on_no_advance(state)
+                return
             # Action-relevantly unchanged state => the game did not accept
             # the action; identical to the chunk ACTION_REJECTED semantics.
             self._metrics.record_action_rejected()

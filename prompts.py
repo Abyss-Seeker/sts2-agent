@@ -121,7 +121,10 @@ field is only a concise summary of your conclusion.
 # "use external public knowledge" / "consult current-build public reference
 # information if available", which conflicts with the benchmark epistemic
 # policy and duplicated RULEBOOK/CONTRACT at length).
-LEGACY_CUSTOM_PROMPT_MARKERS = ("external public knowledge",)
+LEGACY_CUSTOM_PROMPT_MARKERS = (
+    "external public knowledge",
+    "consult current-build public reference",
+)
 
 LEGACY_DEFAULT_USER_TEMPLATES = [
     """\
