@@ -20,6 +20,15 @@ from typing import Any
 
 from action_plan import ActionChunk, PlanParseError, parse_action_chunk
 from benchmark_metrics import BenchmarkMetrics
+# Native modal selection screens: a gameplay command (Headbutt, potion,
+# deck selection...) may synchronously await one of these before it
+# returns. They are REAL decision screens, never a rejection (§11/§27-B).
+SELECTION_SCREEN_TYPES = frozenset({"card_select"})
+
+# §25: how many identical (state, action) rejections before the harness
+# declares a protocol stall instead of looping forever.
+PROTOCOL_STALL_REPEATS = 3
+
 from bridge_client import (
     BridgeAction,
     BridgeStateType,
@@ -625,6 +634,9 @@ class AgentSession:
         # (requested vs actual). NEVER part of the LLM observation.
         self._seed_requested: str = ""
         self._seed_ack: dict[str, Any] | None = None
+        # §25 PROTOCOL_STALL guard: consecutive identical rejections.
+        self._reject_streak = 0
+        self._reject_streak_key: tuple | None = None
         # Adaptive reasoning state
         self._reasoning_context_class = ""
         self._requested_reasoning_effort = ""
@@ -725,6 +737,8 @@ class AgentSession:
             self._pending_single_before_state = None
             self._seed_requested = ""
             self._seed_ack = None
+            self._reject_streak = 0
+            self._reject_streak_key = None
             self._run_baseline_snapshot = self._metrics.checkpoint()
             self._combat_identity = None
             self._reasoning_context_class = ""
@@ -1732,15 +1746,58 @@ class AgentSession:
         """
         executor = self._plan_executor
         event = executor.accept_state(state)
-        if (
+        stype = str(state.get("type", ""))
+        # §11/§27-B: the action successfully INITIATED a native modal
+        # selection (Headbutt discard pick, potion pick, ...). That is a
+        # valid advancement -- NEVER classify it as ACTION_REJECTED just
+        # because the underlying combat snapshot has not moved yet.
+        if stype in SELECTION_SCREEN_TYPES:
+            self._last_checkpoint_reason = "SELECTION_REQUIRED"
+            self._log(
+                "info",
+                "native_selection_observed: 动作已发起，等待原生选择 UI 决策"
+                "（不计为 rejected）。",
+            )
+            self._metrics.record_action_confirmed(from_plan=True, combat=True)
+            self._reject_streak = 0
+        elif (
             event.checkpoint is not None
             and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
         ):
             self._metrics.record_action_rejected()
+            self._on_action_rejected(state)
         else:
             self._metrics.record_action_confirmed(from_plan=True, combat=True)
+            self._reject_streak = 0
         self._consume_executor_event(event, state)
         return event
+
+    def _on_action_rejected(self, state: dict[str, Any]) -> None:
+        """§25/§26: PROTOCOL_STALL guard -- the same action rejected by the
+        same authoritative state repeatedly means the bridge/game lifecycle
+        is desynced (typically a modal the harness cannot see). Surface it
+        as a controlled protocol failure; never let the model burn gameplay
+        resources (potions) to poke the state forward."""
+        fp = self._visible_state_fingerprint(state) or "?"
+        key = (fp, json.dumps(self._pending_single_action, sort_keys=True,
+                              ensure_ascii=False)
+               if self._pending_single_action else fp)
+        if key == self._reject_streak_key:
+            self._reject_streak += 1
+        else:
+            self._reject_streak_key = key
+            self._reject_streak = 1
+        if self._reject_streak >= PROTOCOL_STALL_REPEATS:
+            self._log(
+                "error",
+                f"PROTOCOL_STALL: 同一权威状态重复拒绝同一动作"
+                f" {self._reject_streak} 次（可能存在隐藏/模态 UI 或"
+                " bridge lifecycle desync）— 不再尝试新的战略动作。",
+            )
+            self._metrics.invalidate(
+                "PROTOCOL_STALL: repeated identical rejection")
+            self._log("benchmark_invalidated", "PROTOCOL_STALL")
+            self._stop.set()
 
     def _handle_combat_chunk_state(
         self,
@@ -2735,10 +2792,17 @@ class AgentSession:
                 "该动作既不计为 confirmed 也不计为 rejected。",
             )
             return
-        if fp_before == fp_after:
+        if str(state.get("type", "")) in SELECTION_SCREEN_TYPES:
+            # §11/§27-B: single-action mode -- the action opened a native
+            # modal selection; valid advancement, never "unchanged".
+            self._last_checkpoint_reason = "SELECTION_REQUIRED"
+            self._metrics.record_action_confirmed(from_plan=False)
+            self._reject_streak = 0
+        elif fp_before == fp_after:
             # Action-relevantly unchanged state => the game did not accept
             # the action; identical to the chunk ACTION_REJECTED semantics.
             self._metrics.record_action_rejected()
+            self._on_action_rejected(state)
         else:
             self._metrics.record_action_confirmed(from_plan=False)
 
