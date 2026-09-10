@@ -29,21 +29,12 @@ SELECTION_SCREEN_TYPES = frozenset({"card_select"})
 # declares a protocol stall instead of looping forever.
 PROTOCOL_STALL_REPEATS = 3
 
-# Bridge result strings that mean "the command was really taken by the
-# game" (§27-B): if the authoritative snapshot has not advanced yet, the
-# action is ACCEPTED-but-pending, never REJECTED.
-_ACCEPTED_RESULT_MARKERS = (
-    "ended turn", "played card", "used potion", "chose",
-    "used", "played", "selected",
-)
-
-
-def _bridge_accepted(result: str) -> bool:
-    r = str(result or "").strip().lower()
-    if not r or r.startswith("error") or "refused" in r \
-            or "cannot" in r or "invalid" in r:
-        return False
-    return any(m in r for m in _ACCEPTED_RESULT_MARKERS)
+# SENT != ACCEPTED. The strings produced by _execute() ("played card 0",
+# "ended turn", ...) only describe what was HANDED TO THE SOCKET; they are
+# logging/diagnostics and are NEVER the source of truth for acceptance. The
+# authoritative game-side outcome arrives as the next state's
+# ``previous_action_result`` metadata and is resolved by
+# checkpoint.resolve_action_acceptance().
 
 from bridge_client import (
     BridgeAction,
@@ -52,7 +43,11 @@ from bridge_client import (
     TERMINAL_SCREEN_TYPES,
     STS2GameClient,
 )
-from checkpoint import CheckpointReason
+from checkpoint import (
+    ActionAcceptance,
+    CheckpointReason,
+    resolve_action_acceptance,
+)
 from context_manager import ContextConfig, ContextManager
 from plan_executor import ActionChunkExecutor, ExecutorStatus
 from game_state import (
@@ -657,8 +652,13 @@ class AgentSession:
         self._reject_streak_key: tuple | None = None
         self._no_advance_streak = 0
         self._no_advance_key: tuple | None = None
-        # Bridge result string of the action currently in flight.
+        # Bridge result string of the action currently in flight (LOG ONLY --
+        # never an acceptance signal).
         self._pending_action_result: str = ""
+        # request_id of the state the in-flight gameplay command answered.
+        # The authoritative ACK for that command must carry exactly this
+        # request_id; anything else is UNKNOWN (never a stale-ACK upgrade).
+        self._pending_action_request_id: str = ""
         # Adaptive reasoning state
         self._reasoning_context_class = ""
         self._requested_reasoning_effort = ""
@@ -764,6 +764,7 @@ class AgentSession:
             self._no_advance_streak = 0
             self._no_advance_key = None
             self._pending_action_result = ""
+            self._pending_action_request_id = ""
             self._run_baseline_snapshot = self._metrics.checkpoint()
             self._combat_identity = None
             self._reasoning_context_class = ""
@@ -1375,6 +1376,7 @@ class AgentSession:
         self._pending_single_action = None
         self._pending_single_before_state = None
         self._pending_action_result = ""
+        self._pending_action_request_id = ""
         # A reconnect is a clean lifecycle boundary: the stall guards must
         # not carry a stale streak across it.
         self._reject_streak = 0
@@ -1779,20 +1781,36 @@ class AgentSession:
 
         Three-way outcome (the executor owns classification):
           CONFIRMED         -- the visible world moved forward.
-          AWAITING_ADVANCE  -- bridge accepted, world not advanced yet; the
+          AWAITING_ADVANCE  -- game ACCEPTED, world not advanced yet; the
                                in-flight action is RETAINED and the caller
                                must simply wait for another state.
-          REJECTED          -- the game/bridge did NOT accept the command.
+          REJECTED          -- the game REJECTED the command.
+          ADVANCE_UNVERIFIED-- unchanged state with no authoritative
+                               acceptance signal (conservative wait).
         A connection lost before the next state is never counted as
         confirmed.
         """
         executor = self._plan_executor
         event = executor.accept_state(
             state,
-            bridge_accepted=_bridge_accepted(self._pending_action_result),
+            acceptance=self._resolve_action_acceptance(state),
         )
         self._classify_inflight_reconcile(state, event)
         return event
+
+    def _resolve_action_acceptance(self, state: dict[str, Any]) -> ActionAcceptance:
+        """AUTHORITATIVE acceptance for the in-flight gameplay command.
+
+        Reads the state's ``previous_action_result`` controller metadata and
+        correlates it with the request_id of the state our command answered.
+        SENT != ACCEPTED: no metadata, a missing id, or a mismatched (stale)
+        ACK all resolve to UNKNOWN -- never an invented acceptance.
+        """
+        acceptance = resolve_action_acceptance(
+            state.get("previous_action_result"),
+            self._pending_action_request_id,
+        )
+        return acceptance
 
     def _classify_inflight_reconcile(
         self, state: dict[str, Any], event: Any
@@ -1819,10 +1837,16 @@ class AgentSession:
             self._no_advance_streak = 0
             self._no_advance_key = None
         elif event.status == ExecutorStatus.WAITING_ADVANCE:
-            # ACCEPTED, NOT YET OBSERVABLY ADVANCED: never confirmed, never
-            # rejected. The executor retains the in-flight action and the
-            # plan; we only record the transient observation (and bound it).
-            self._on_no_advance(state)
+            # ACCEPTED (or unverifiable), NOT YET OBSERVABLY ADVANCED: never
+            # confirmed, never rejected. The executor retains the in-flight
+            # action and the plan; we only record the transient observation
+            # (and bound it) with its exact reason.
+            reason = (
+                event.checkpoint.reason
+                if event.checkpoint is not None
+                else CheckpointReason.AWAITING_ADVANCE
+            )
+            self._on_no_advance(state, reason)
         elif (
             event.checkpoint is not None
             and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
@@ -1867,20 +1891,37 @@ class AgentSession:
             )
         return ""
 
-    def _on_no_advance(self, state: dict[str, Any]) -> None:
-        """§27-B: the command was accepted but the visible world did not
-        advance. Counted as an unconfirmable OBSERVATION (never confirmed,
+    def _on_no_advance(
+        self,
+        state: dict[str, Any],
+        reason: CheckpointReason = CheckpointReason.AWAITING_ADVANCE,
+    ) -> None:
+        """§27-B: the visible world did not advance for the in-flight
+        command. Counted as an unconfirmable OBSERVATION (never confirmed,
         never rejected) and bounded: repeating on the same state + same
         unresolved action means the bridge/game lifecycle is stuck
-        (modal/animation/desync)."""
+        (modal/animation/desync).
+
+        ``reason`` distinguishes an AUTHORITATIVELY ACCEPTED command
+        (AWAITING_ADVANCE) from an UNVERIFIED one (ADVANCE_UNVERIFIED, no
+        authoritative acceptance signal). Both wait; neither is invented as
+        accepted or claimed as rejected.
+        """
+        unverified = reason is CheckpointReason.ADVANCE_UNVERIFIED
         self._metrics.record_action_unconfirmable()
-        self._last_checkpoint_reason = "AWAITING_ADVANCE"
+        self._last_checkpoint_reason = reason.value
         self._log(
             "warning",
-            "ACTION_ACCEPTED_NO_ADVANCE: 命令已被游戏接受但权威状态未推进"
-            f"（result={self._pending_action_result!r}）——可能因回合切换/"
-            "动画/模态 UI；不计为 confirmed 也不计为 rejected，"
-            "保留原动作继续等待。",
+            (
+                "ACTION_UNVERIFIED_NO_ADVANCE: 权威可见状态未推进且无权威"
+                "接受信号（无/过期 ACK）——既不计 confirmed 也不计 "
+                "rejected，保守等待。"
+                if unverified else
+                "ACTION_ACCEPTED_NO_ADVANCE: 命令已被游戏接受但权威状态未推进"
+                "——可能因回合切换/动画/模态 UI；不计为 confirmed 也不计为 "
+                "rejected，保留原动作继续等待。"
+            )
+            + f"（result={self._pending_action_result!r}）",
         )
         fp = self._visible_state_fingerprint(state) or "?"
         key = (fp, self._pending_action_identity())
@@ -1950,7 +1991,7 @@ class AgentSession:
         if event is None and executor.inflight is not None:
             event = executor.accept_state(
                 state,
-                bridge_accepted=_bridge_accepted(self._pending_action_result),
+                acceptance=self._resolve_action_acceptance(state),
             )
             self._classify_inflight_reconcile(state, event)
 
@@ -2302,6 +2343,9 @@ class AgentSession:
                 step_index=prepared.step_index,
             )
             return
+        # Correlate the command with the state it answers: the authoritative
+        # ACK attached to a later state must carry exactly this request_id.
+        self._pending_action_request_id = str(state.get("request_id") or "")
         self._plan_executor.mark_sent(prepared, state)
         self._metrics.record_action_sent(from_plan=True, combat=True)
         self._current_plan_step = prepared.step_index + 1
@@ -2886,6 +2930,9 @@ class AgentSession:
         self._pending_single_action = act
         self._pending_single_before_state = snapshot
         self._pending_action_result = str(result)
+        # Correlate the command with the state it answers (see
+        # _send_prepared_plan_step): the authoritative ACK must match.
+        self._pending_action_request_id = str(state.get("request_id") or "")
         return result
 
     def _visible_state_fingerprint(self, state: dict[str, Any]) -> str | None:
@@ -2915,10 +2962,12 @@ class AgentSession:
         next authoritative bridge state (main-loop Step A for
         single_action mode).
 
-        Returns True when the action is ACCEPTED-but-not-yet-observably-
-        advanced (AWAITING_ADVANCE): the pending action is RETAINED so the
-        caller must WAIT for another authoritative state instead of
-        routing the stale snapshot to the model.
+        Acceptance comes ONLY from the state's ``previous_action_result``
+        (never from the local send string). Returns True when the action is
+        ACCEPTED -- or unverifiable -- but not yet observably advanced
+        (WAITING_ADVANCE): the pending action is RETAINED so the caller must
+        WAIT for another authoritative state instead of routing the stale
+        snapshot to the model.
         """
         act = self._pending_single_action
         before = self._pending_single_before_state
@@ -2952,24 +3001,28 @@ class AgentSession:
             self._no_advance_key = None
             return False
         if fp_before == fp_after:
-            if _bridge_accepted(self._pending_action_result):
-                # §27-B: the bridge ACCEPTED the command ("ended turn",
-                # "played card N", ...) but the authoritative snapshot has
-                # not advanced yet (turn switch / animation / modal). That
-                # is NOT a rejection -- RETAIN the pending action and wait
-                # for the next authoritative state (never re-prompt, never
-                # "poke" the state with a resource).
-                self._on_no_advance(state)
-                return True
-            # Action-relevantly unchanged state AND the bridge did not
-            # report acceptance => the game really refused the action.
-            self._pending_single_action = None
-            self._pending_single_before_state = None
-            self._metrics.record_action_rejected()
-            self._no_advance_streak = 0
-            self._no_advance_key = None
-            self._on_action_rejected(state)
-            return False
+            acceptance = self._resolve_action_acceptance(state)
+            if acceptance is ActionAcceptance.REJECTED:
+                # Authoritative REJECTION: the game refused the command and
+                # the state is unchanged. Clear the pending action so fresh
+                # cognition is permitted.
+                self._pending_single_action = None
+                self._pending_single_before_state = None
+                self._metrics.record_action_rejected()
+                self._no_advance_streak = 0
+                self._no_advance_key = None
+                self._on_action_rejected(state)
+                return False
+            # ACCEPTED (or UNKNOWN/unverifiable): NOT a rejection. RETAIN the
+            # pending action and wait for the next authoritative state --
+            # never re-prompt, never "poke" the state with a resource.
+            reason = (
+                CheckpointReason.AWAITING_ADVANCE
+                if acceptance is ActionAcceptance.ACCEPTED
+                else CheckpointReason.ADVANCE_UNVERIFIED
+            )
+            self._on_no_advance(state, reason)
+            return True
         self._pending_single_action = None
         self._pending_single_before_state = None
         self._metrics.record_action_confirmed(from_plan=False)

@@ -29,6 +29,7 @@ from agent import (  # noqa: E402
     AgentSession, PROTOCOL_STALL_REPEATS, SELECTION_SCREEN_TYPES,
 )
 from benchmark_metrics import BenchmarkMetrics  # noqa: E402
+from checkpoint import ActionAcceptance  # noqa: E402
 
 
 def card(cid, *, target="Self", playable=True, cost=1):
@@ -136,7 +137,7 @@ class TestAwaitingAdvanceLifecycle(unittest.TestCase):
             combat_state("S1", energy=3, hand=[
                 card("HEADBUTT", target="AnyEnemy"),
                 card("STRIKE", target="AnyEnemy")]),
-            bridge_accepted=True,
+            acceptance=ActionAcceptance.ACCEPTED,
         )
         self.assertEqual(event.status, ExecutorStatus.WAITING_ADVANCE)
         self.assertIsNotNone(ex.inflight)
@@ -145,7 +146,8 @@ class TestAwaitingAdvanceLifecycle(unittest.TestCase):
 
         # The native selection then arrives: it resolves the SAME in-flight
         # action as a screen change and discards the stale remainder.
-        event = ex.accept_state(selection_state("SEL"), bridge_accepted=True)
+        event = ex.accept_state(
+            selection_state("SEL"), acceptance=ActionAcceptance.ACCEPTED)
         self.assertEqual(event.status, ExecutorStatus.NEED_MODEL)
         self.assertIn(event.checkpoint.reason.value,
                       ("SCREEN_CHANGED", "SELECTION_REQUIRED"))

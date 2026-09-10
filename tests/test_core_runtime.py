@@ -9,7 +9,11 @@ sys.path.insert(0, str(ROOT))
 
 from action_plan import parse_action_chunk, PlanParseError
 from plan_executor import ActionChunkExecutor, ExecutorStatus
-from checkpoint import CheckpointReason
+from checkpoint import (
+    ActionAcceptance,
+    CheckpointReason,
+    resolve_action_acceptance,
+)
 from state_diff import diff_states, render_delta
 from benchmark_metrics import BenchmarkMetrics
 from deepseek_provider_reference import (
@@ -335,8 +339,8 @@ def test_duplicate_cards_resolve_after_shift():
     assert ev.prepared.bridge_action["card_index"] == 0
 
 
-def test_unchanged_state_without_bridge_accept_is_rejected_do_not_replay():
-    """Bridge did NOT accept the command + unchanged state => REJECTED."""
+def test_unchanged_state_with_authoritative_rejection_is_rejected():
+    """Game-side REJECTED + unchanged state => ACTION_REJECTED, plan reset."""
     s0 = combat_state(
         request_id="r0",
         energy=3,
@@ -354,13 +358,42 @@ def test_unchanged_state_without_bridge_accept_is_rejected_do_not_replay():
     ev = ex.prepare_next(s0, validate_action)
     ex.mark_sent(ev.prepared, s0)
 
-    # Same visible state, different request id, NO bridge acceptance.
     s1 = dict(s0)
     s1["request_id"] = "r1"
-    ev = ex.accept_state(s1)  # bridge_accepted defaults to False
+    ev = ex.accept_state(s1, acceptance=ActionAcceptance.REJECTED)
     assert ev.status == ExecutorStatus.NEED_MODEL
     assert ev.checkpoint.reason == CheckpointReason.ACTION_REJECTED
     assert not ex.has_pending_plan
+
+
+def test_unchanged_state_without_authoritative_signal_is_conservative_wait():
+    """UNKNOWN + unchanged state => ADVANCE_UNVERIFIED: conservative bounded
+    WAITING. Never confirmed, never rejected, action retained."""
+    s0 = combat_state(
+        request_id="r0",
+        energy=3,
+        hand=[card("STRIKE", target="AnyEnemy")],
+    )
+    chunk = parse_action_chunk(
+        {
+            "thought": "Strike once.",
+            "actions": [{"kind": "play", "card_ref": "h0", "target_ref": "e0"}],
+        },
+        s0,
+    )
+    ex = ActionChunkExecutor()
+    ex.submit(chunk)
+    ev = ex.prepare_next(s0, validate_action)
+    ex.mark_sent(ev.prepared, s0)
+
+    s1 = dict(s0)
+    s1["request_id"] = "r1"
+    ev = ex.accept_state(s1)  # acceptance defaults to UNKNOWN
+    assert ev.status == ExecutorStatus.WAITING_ADVANCE, ev
+    assert ev.checkpoint.reason == CheckpointReason.ADVANCE_UNVERIFIED
+    assert ex.inflight is not None
+    assert ex.has_pending_plan
+    assert ex.index == 0
 
 
 def test_unchanged_state_with_bridge_accept_is_awaiting_advance():
@@ -390,7 +423,7 @@ def test_unchanged_state_with_bridge_accept_is_awaiting_advance():
     # Accepted but the visible world has not moved: WAIT, do not reset.
     s1 = dict(s0)
     s1["request_id"] = "r1"
-    ev = ex.accept_state(s1, bridge_accepted=True)
+    ev = ex.accept_state(s1, acceptance=ActionAcceptance.ACCEPTED)
     assert ev.status == ExecutorStatus.WAITING_ADVANCE, ev
     assert ev.checkpoint.reason == CheckpointReason.AWAITING_ADVANCE
     assert ex.inflight is not None
@@ -415,7 +448,7 @@ def test_unchanged_state_with_bridge_accept_is_awaiting_advance():
         }],
         discard_count=1,
     )
-    ev = ex.accept_state(s2, bridge_accepted=True)
+    ev = ex.accept_state(s2, acceptance=ActionAcceptance.ACCEPTED)
     assert ev.status == ExecutorStatus.READY_ACTION, ev
     assert ex.index == 1
     ev = ex.prepare_next(s2, validate_action)
@@ -424,6 +457,35 @@ def test_unchanged_state_with_bridge_accept_is_awaiting_advance():
         "card_index": 0,
         "target_index": -1,
     }
+
+
+def test_action_acceptance_request_id_correlation():
+    """The ACK must correspond to the EXACT handshake. A stale/mismatched
+    request_id, a missing field, or a non-bool accepted never yields
+    ACCEPTED or REJECTED -- it is UNKNOWN."""
+    # Exact match.
+    assert resolve_action_acceptance(
+        {"request_id": "r7", "accepted": True}, "r7"
+    ) is ActionAcceptance.ACCEPTED
+    assert resolve_action_acceptance(
+        {"request_id": "r7", "accepted": False}, "r7"
+    ) is ActionAcceptance.REJECTED
+    # Stale ACK from an earlier handshake (action N must not classify N+1).
+    assert resolve_action_acceptance(
+        {"request_id": "r6", "accepted": True}, "r7"
+    ) is ActionAcceptance.UNKNOWN
+    # Missing / malformed metadata.
+    assert resolve_action_acceptance(None, "r7") is ActionAcceptance.UNKNOWN
+    assert resolve_action_acceptance(
+        {"accepted": True}, "r7"
+    ) is ActionAcceptance.UNKNOWN
+    assert resolve_action_acceptance(
+        {"request_id": "r7", "accepted": "yes"}, "r7"
+    ) is ActionAcceptance.UNKNOWN
+    # No expected request id (we never sent a correlated command).
+    assert resolve_action_acceptance(
+        {"request_id": "r7", "accepted": True}, ""
+    ) is ActionAcceptance.UNKNOWN
 
 
 def test_model_requested_checkpoint():
@@ -569,8 +631,10 @@ def run_all():
         test_draw_causes_checkpoint,
         test_target_gone_causes_checkpoint,
         test_duplicate_cards_resolve_after_shift,
-        test_unchanged_state_without_bridge_accept_is_rejected_do_not_replay,
+        test_unchanged_state_with_authoritative_rejection_is_rejected,
+        test_unchanged_state_without_authoritative_signal_is_conservative_wait,
         test_unchanged_state_with_bridge_accept_is_awaiting_advance,
+        test_action_acceptance_request_id_correlation,
         test_model_requested_checkpoint,
         test_parser_rejects_actions_after_checkpoint,
         test_delta_render,

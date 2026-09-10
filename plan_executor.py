@@ -22,6 +22,7 @@ from action_plan import (
     resolve_enemy_ref,
 )
 from checkpoint import (
+    ActionAcceptance,
     CheckpointDecision,
     CheckpointReason,
     evaluate_after_action,
@@ -243,7 +244,7 @@ class ActionChunkExecutor:
         self,
         after_state: dict[str, Any],
         *,
-        bridge_accepted: bool = False,
+        acceptance: ActionAcceptance = ActionAcceptance.UNKNOWN,
     ) -> ExecutorEvent:
         """Reconcile the next authoritative bridge state after one send.
 
@@ -251,12 +252,13 @@ class ActionChunkExecutor:
         caller should invoke prepare_next(after_state, validate_action).
         This separation keeps validation at the latest authoritative state.
 
-        ``bridge_accepted`` must be the caller's evidence that the bridge
-        really took the sent command. It is REQUIRED to distinguish a real
-        rejection from an accepted-but-not-yet-observable action. The
-        executor owns that classification (and therefore the mutation
-        decision) so it can NEVER irreversibly reset a plan that is merely
-        waiting for the authoritative world to advance.
+        ``acceptance`` is the AUTHORITATIVE game-side outcome (see
+        :class:`ActionAcceptance`) of the command that produced
+        ``after_state``. It is REQUIRED to distinguish a real rejection from
+        an accepted-but-not-yet-observable action, and from an unverifiable
+        one. The executor owns that classification (and therefore the
+        mutation decision) so it can NEVER irreversibly reset a plan that is
+        merely waiting for the authoritative world to advance.
         """
         if self._inflight is None or self._before_state is None or self.chunk is None:
             return ExecutorEvent(
@@ -283,20 +285,24 @@ class ActionChunkExecutor:
             chunk=self.chunk,
             executed_action=executed.planned,
             next_action=next_action,
-            bridge_accepted=bridge_accepted,
+            acceptance=acceptance,
         )
         chunk_exhausted = next_index >= len(self.chunk.actions)
 
-        if checkpoint.reason is CheckpointReason.AWAITING_ADVANCE:
-            # ACCEPTED BUT NOT YET OBSERVABLY ADVANCED is a WAITING state.
-            # Retain the in-flight step AND the original before-state so the
-            # SAME command can be reconciled against a later authoritative
-            # state. Do NOT advance the index, do NOT reset the chunk.
+        if checkpoint.reason in (
+            CheckpointReason.AWAITING_ADVANCE,
+            CheckpointReason.ADVANCE_UNVERIFIED,
+        ):
+            # ACCEPTED (or unverifiable) BUT NOT YET OBSERVABLY ADVANCED is a
+            # WAITING state. Retain the in-flight step AND the original
+            # before-state so the SAME command can be reconciled against a
+            # later authoritative state. Do NOT advance the index, do NOT
+            # reset the chunk.
             return ExecutorEvent(
                 ExecutorStatus.WAITING_ADVANCE,
                 checkpoint=checkpoint,
                 prepared=executed,
-                detail="bridge accepted; awaiting authoritative advance",
+                detail="awaiting authoritative advance",
             )
 
         # Clear in-flight tracking before any resolving return.

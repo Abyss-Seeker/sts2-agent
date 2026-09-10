@@ -193,12 +193,15 @@ class STS2GameClient:
                 # ERROR SEMANTICS (verified against BridgeServer.cs): the
                 # mod never initiates {"type":"error"} messages; the filter
                 # here is purely defensive for protocol acknowledgements.
-                # When the game REJECTS an agent action it does NOT send an
-                # error -- the relevant handler simply re-serializes the
-                # unchanged state and asks again, i.e. the retry loop lives
-                # on the mod side and surfaces as a new (identical) state.
-                # There is therefore no "action rejected but game still
-                # waiting" message type to forward to the agent.
+                #
+                # ACCEPTANCE IS NOT AN ERROR MESSAGE. The authoritative
+                # game-side outcome of a gameplay command travels as the
+                # NEXT real state's ``previous_action_result`` metadata
+                # ({"request_id","accepted","reason"}), attached by
+                # BridgeServer.RecordActionResult / AttachPendingActionResult
+                # from the C# handler lifecycle. It is controller metadata,
+                # correlated by request_id, and is never routed to the LLM as
+                # a game state (the state formatters read only known fields).
                 logger.warning("Server error: %s", data)
                 continue
             else:

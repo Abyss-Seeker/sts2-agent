@@ -15,7 +15,7 @@ Acceptance tests (review-remediated semantics):
           noncombat choice path; no stale combat action is executed.
   TEST 4  lethal action followed by reward_screen: in-flight action
           confirmed and the chunk exhausted -> plan COMPLETED.
-  TEST 5 (P0) bridge ACCEPTED + action-relevantly UNCHANGED state:
+  TEST 5 (P0) authoritative ACCEPTED + action-relevantly UNCHANGED state:
           sent += 1, confirmed += 0, rejected += 0, unconfirmable += 1,
           the chunk is RETAINED, no re-prompt and no second gameplay
           action (AWAITING_ADVANCE is a waiting state, not a rejection).
@@ -25,12 +25,21 @@ Acceptance tests (review-remediated semantics):
           snapshot.
   TEST 5c accepted + unchanged, THEN normal advance: the SAME in-flight
           action is confirmed exactly once and the chunk continues.
-  TEST 5d explicit bridge rejection (no acceptance marker) is still a real
-          rejection.
+  TEST 5d authoritative accepted=false -> ACTION_REJECTED, plan reset.
+  TEST 5f no ACK / UNKNOWN + unchanged -> ADVANCE_UNVERIFIED: conservative
+          bounded wait, NOT confirmed, NOT rejected, action retained.
+  TEST 5g stale/mismatched ACK request_id must NOT classify the current
+          action (resolves to UNKNOWN).
   TEST 5e repeated accepted + unchanged -> bounded PROTOCOL_STALL.
+  TEST 5h authoritative rejection resets the plan and re-prompts (fresh
+          cognition is still permitted for a real rejection).
   TEST 6  API timeout (strict): llm_request_count and
           llm_failed_request_count increase, benchmark invalid, ZERO
           fallback strategic actions.
+
+  Acceptance is NEVER inferred from the local send string ("played card")
+  -- it comes only from the protocol's ``previous_action_result`` metadata
+  correlated by request_id (BridgeServer / RlCombatHandler, C# side).
 
 Run:  python .\\tests\\test_beta_e2e.py
 """
@@ -43,6 +52,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -142,16 +152,51 @@ class FakeBridge(threading.Thread):
         accepted-but-not-yet-advanced lifecycles, where one gameplay
         command legitimately produces several authoritative observations
         and the harness sends NO action for the unchanged ones.
+
+    ``outcomes`` models the GAME-SIDE acceptance of the command that
+    answered each state (the protocol's ``previous_action_result``). It is
+    attached to the NEXT state, exactly like the real BridgeServer:
+
+      outcomes[i] is the outcome for the action that answered states[i],
+      carried by states[i+1]:
+        None            -> no ACK metadata (UNKNOWN acceptance)
+        True / False    -> {"request_id": states[i].request_id,
+                            "accepted": <bool>}
+        dict            -> used verbatim (e.g. a stale/mismatched
+                           request_id to prove it must NOT classify).
     """
 
     def __init__(self, port: int, states: list[dict], *,
-                 action_wait: float | None = None):
+                 action_wait: float | None = None,
+                 outcomes: list[Any] | None = None):
         super().__init__(daemon=True)
         self.port = port
         self.states = states
         self.action_wait = action_wait
+        self.outcomes = outcomes
         self.actions: list[dict] = []
         self.error: str | None = None
+
+    def _payload_for(self, index: int) -> dict:
+        """State dict + the previous_action_result for the prior state."""
+        payload = dict(self.states[index])
+        if index == 0 or self.outcomes is None:
+            return payload
+        prev = index - 1
+        if prev >= len(self.outcomes):
+            return payload
+        spec = self.outcomes[prev]
+        if spec is None:
+            return payload
+        if isinstance(spec, dict):
+            payload["previous_action_result"] = spec
+            return payload
+        payload["previous_action_result"] = {
+            "request_id": self.states[prev].get("request_id"),
+            "accepted": bool(spec),
+            "reason": "fake bridge outcome",
+        }
+        return payload
 
     def run(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -185,8 +230,8 @@ class FakeBridge(threading.Thread):
             assert a and a.get("action") == "set_fallback", a
             a = recv()
             assert a and a.get("action") == "set_agent_timeout", a
-            for st in self.states:
-                send(st)
+            for idx, st in enumerate(self.states):
+                send(self._payload_for(idx))
                 deadline = (
                     None if self.action_wait is None
                     else time.time() + self.action_wait
@@ -252,8 +297,10 @@ class MockLLM(agent_mod.LLMClient):
 
 
 def run_agent(port: int, llm_cls, cfg: dict | None = None,
-              states: list[dict] | None = None, bridge_wait: float | None = None):
-    bridge = FakeBridge(port, states or [], action_wait=bridge_wait)
+              states: list[dict] | None = None, bridge_wait: float | None = None,
+              outcomes: list[Any] | None = None):
+    bridge = FakeBridge(port, states or [], action_wait=bridge_wait,
+                        outcomes=outcomes)
     bridge.start()
 
     agent_mod.LLMClient = llm_cls
@@ -521,7 +568,8 @@ def test_accepted_no_advance_does_not_reprompt() -> None:
     s1 = combat_state("r1", energy=3,
                       hand=[card("STRIKE", target="AnyEnemy"), card("DEFEND")])
 
-    s, bridge = run_agent(9123, LLM, states=[s0, s1], bridge_wait=0.6)
+    s, bridge = run_agent(9123, LLM, states=[s0, s1], bridge_wait=0.6,
+                          outcomes=[True])
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
@@ -572,7 +620,8 @@ def test_accepted_no_advance_then_native_selection() -> None:
         card("HEADBUTT", target="AnyEnemy"), card("STRIKE", target="AnyEnemy")])
     s2 = card_select_state("r2")
 
-    s, bridge = run_agent(9133, LLM, states=[s0, s1, s2], bridge_wait=0.6)
+    s, bridge = run_agent(9133, LLM, states=[s0, s1, s2], bridge_wait=0.6,
+                          outcomes=[True, None])
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
@@ -616,7 +665,8 @@ def test_accepted_no_advance_then_normal_advance() -> None:
     s2 = combat_state("r2", energy=2, hand=[], enemies=[cultist(34)],
                       discard_count=1)
 
-    s, bridge = run_agent(9134, LLM, states=[s0, s1, s2], bridge_wait=0.6)
+    s, bridge = run_agent(9134, LLM, states=[s0, s1, s2], bridge_wait=0.6,
+                          outcomes=[True, None])
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
@@ -638,21 +688,17 @@ def test_accepted_no_advance_then_normal_advance() -> None:
 
 
 # ----------------------------------------------------------------
-# TEST 5d — a genuinely REJECTED command is still rejected
+# TEST 5d — a genuinely REJECTED command (authoritative ACK) is rejected
 # ----------------------------------------------------------------
 
-def test_explicit_bridge_rejection_is_rejected() -> None:
-    """No bridge acceptance marker + action-relevantly unchanged state =>
-    a REAL rejection: rejected += 1, unconfirmable unchanged, plan reset so
-    fresh cognition is permitted."""
+def _session_with_inflight_play(s0, request_id: str):
+    """AgentSession with one committed play marked in flight for request_id."""
     s = AgentSession()
     s._metrics = BenchmarkMetrics()
     s._logs = []
     s._stop = threading.Event()
-    s._pending_action_result = ""  # bridge reported NO acceptance
-
-    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
-    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s._pending_action_result = ""  # mere local send string: never acceptance
+    s._pending_action_request_id = request_id
     chunk = parse_action_chunk({
         "thought": "strike once",
         "actions": [{"kind": "play", "card_ref": "h0", "target_ref": "e0"}],
@@ -661,6 +707,17 @@ def test_explicit_bridge_rejection_is_rejected() -> None:
     ex.submit(chunk)
     ev = ex.prepare_next(s0, agent_mod.validate_action)
     ex.mark_sent(ev.prepared, s0)
+    return s, ex
+
+
+def test_authoritative_rejection_is_rejected() -> None:
+    """Authoritative accepted=false + unchanged state => REAL rejection:
+    rejected += 1, unconfirmable unchanged, plan reset (fresh cognition)."""
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s, ex = _session_with_inflight_play(s0, "r0")
+    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s1["previous_action_result"] = {
+        "request_id": "r0", "accepted": False, "reason": "card not playable"}
 
     event = s._reconcile_inflight_if_any(s1)
     assert event.status == ExecutorStatus.NEED_MODEL, event
@@ -668,7 +725,45 @@ def test_explicit_bridge_rejection_is_rejected() -> None:
     assert s._metrics.game_action_rejected_count == 1
     assert s._metrics.game_action_unconfirmable_count == 0
     assert not ex.has_pending_plan
-    print("PASS TEST 5d explicit_bridge_rejection_is_rejected")
+    print("PASS TEST 5d authoritative_rejection_is_rejected")
+
+
+def test_unknown_acceptance_is_conservative_wait() -> None:
+    """No ACK metadata + unchanged state => UNKNOWN: conservative bounded
+    waiting. NOT falsely confirmed, NOT falsely rejected, action retained."""
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s, ex = _session_with_inflight_play(s0, "r0")
+    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+
+    event = s._reconcile_inflight_if_any(s1)
+    assert event.status == ExecutorStatus.WAITING_ADVANCE, event
+    assert event.checkpoint.reason == CheckpointReason.ADVANCE_UNVERIFIED, event
+    assert s._metrics.game_action_confirmed_count == 0
+    assert s._metrics.game_action_rejected_count == 0
+    assert s._metrics.game_action_unconfirmable_count == 1
+    assert s._last_checkpoint_reason == "ADVANCE_UNVERIFIED"
+    assert ex.has_pending_plan and ex.inflight is not None
+    assert ex.index == 0
+    print("PASS TEST 5f unknown_acceptance_is_conservative_wait")
+
+
+def test_stale_ack_cannot_classify_current_action() -> None:
+    """An ACK whose request_id belongs to an EARLIER handshake must never
+    classify the current action as accepted: it resolves to UNKNOWN."""
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s, ex = _session_with_inflight_play(s0, "r0")
+    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    # ACK accepted=true but for a DIFFERENT (stale) request id.
+    s1["previous_action_result"] = {"request_id": "r0-stale",
+                                    "accepted": True}
+
+    event = s._reconcile_inflight_if_any(s1)
+    assert event.status == ExecutorStatus.WAITING_ADVANCE, event
+    assert event.checkpoint.reason == CheckpointReason.ADVANCE_UNVERIFIED, event
+    assert s._metrics.game_action_confirmed_count == 0
+    assert s._metrics.game_action_rejected_count == 0
+    assert ex.has_pending_plan
+    print("PASS TEST 5g stale_ack_cannot_classify_current_action")
 
 
 # ----------------------------------------------------------------
@@ -686,7 +781,8 @@ def test_bounded_stall_on_repeated_accepted_no_advance() -> None:
         for i in range(1, PROTOCOL_STALL_REPEATS + 1)
     ]
 
-    s, bridge = run_agent(9132, LLM, states=[s0] + repeats, bridge_wait=0.4)
+    s, bridge = run_agent(9132, LLM, states=[s0] + repeats, bridge_wait=0.4,
+                          outcomes=[True])
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
@@ -701,6 +797,38 @@ def test_bounded_stall_on_repeated_accepted_no_advance() -> None:
     assert "PROTOCOL_STALL" in st["invalidation_reason"], st
     assert s._stop.is_set()
     print("PASS TEST 5e bounded_stall_on_repeated_accepted_no_advance")
+
+
+# ----------------------------------------------------------------
+# TEST 5h — authoritative rejection resets the plan and re-prompts
+# ----------------------------------------------------------------
+
+def test_authoritative_rejection_reprompts() -> None:
+    """Game-side accepted=false: the plan is reset and the model gets a
+    FRESH cognition (this is what proves UNKNOWN did not swallow real
+    rejection handling)."""
+    class LLM(MockLLM):
+        script = [CHUNK_STRIKE_ONCE, CHUNK_END_TURN]
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+
+    s, bridge = run_agent(9135, LLM, states=[s0, s1], bridge_wait=0.6,
+                          outcomes=[False])
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    # The rejected play was NOT replayed; a fresh decision produced end_turn.
+    assert bridge.actions == [
+        {"action": "play", "card_index": 0, "target_index": 0},
+        {"action": "end_turn"},
+    ], bridge.actions
+    assert st["llm_request_count"] == 2, st
+    assert st["game_action_rejected_count"] == 1, st
+    assert st["game_action_unconfirmable_count"] == 0, st
+    assert st["game_action_confirmed_count"] == 0, st
+    print("PASS TEST 5h authoritative_rejection_reprompts")
 
 
 # ----------------------------------------------------------------
@@ -780,7 +908,7 @@ def test_single_action_accepted_no_advance_waits() -> None:
     s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
 
     s, bridge = run_agent(9129, LLM, cfg={"decision_mode": "single_action"},
-                          states=[s0, s1], bridge_wait=0.6)
+                          states=[s0, s1], bridge_wait=0.6, outcomes=[True])
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
@@ -881,7 +1009,8 @@ def test_chunk_mode_noncombat_accepted_no_advance_waits() -> None:
     s0 = event_state("r0", "Take the gold")
     s1 = event_state("r1", "Take the gold")  # IDENTICAL visible state
 
-    s, bridge = run_agent(9131, LLM, states=[s0, s1], bridge_wait=0.6)
+    s, bridge = run_agent(9131, LLM, states=[s0, s1], bridge_wait=0.6,
+                          outcomes=[True])
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
@@ -903,8 +1032,11 @@ def run_all() -> None:
         test_accepted_no_advance_does_not_reprompt,
         test_accepted_no_advance_then_native_selection,
         test_accepted_no_advance_then_normal_advance,
-        test_explicit_bridge_rejection_is_rejected,
+        test_authoritative_rejection_is_rejected,
+        test_unknown_acceptance_is_conservative_wait,
+        test_stale_ack_cannot_classify_current_action,
         test_bounded_stall_on_repeated_accepted_no_advance,
+        test_authoritative_rejection_reprompts,
         test_explicit_checkpoint,
         test_strict_failure,
         test_single_action_confirmed_by_next_state,
