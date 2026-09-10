@@ -78,10 +78,17 @@ class BenchmarkMetrics:
     # A game action is SENT when handed to the bridge; it is CONFIRMED
     # only by the next authoritative state (the visible world moved
     # forward -- screen changes / new turns / terminal all count), or
-    # REJECTED when the bridge re-emits an action-relevantly unchanged
-    # state. game_action_count stays as the CONFIRMED alias.
-    # UNCONFIRMABLE: the next state arrived but the confirmation could not
-    # be judged reliably -- conservatively NOT counted as confirmed.
+    # REJECTED when the game/bridge really did NOT accept the command
+    # (verified by the bridge result string). game_action_count stays as
+    # the CONFIRMED alias.
+    # UNCONFIRMABLE is an OBSERVATION/EVENT counter (NOT a mutually
+    # exclusive final outcome): it counts each accepted command whose
+    # observed authoritative state has not yet provided visible
+    # confirmation (AWAITING_ADVANCE). A single action may therefore be
+    # counted here once or more while in flight and LATER counted once in
+    # game_action_confirmed_count when the world finally advances -- the
+    # two are deliberately not exclusive (confirmed is a final-outcome
+    # counter, unconfirmable is a transient-observation counter).
     game_action_sent_count: int = 0
     game_action_confirmed_count: int = 0
     game_action_rejected_count: int = 0
@@ -281,12 +288,17 @@ class BenchmarkMetrics:
             self.combat_game_action_confirmed_count += 1
 
     def record_action_rejected(self) -> None:
-        """Bridge re-emitted an action-relevantly unchanged state."""
+        """The game/bridge really did NOT accept the command (evidence from
+        the bridge result string), leaving the authoritative state
+        action-relevantly unchanged."""
         self.game_action_rejected_count += 1
 
     def record_action_unconfirmable(self) -> None:
-        """Confirmation could not be judged reliably (formatter failure /
-        unknown comparison) -- conservatively NOT counted as confirmed."""
+        """ONE transient observation that an accepted command has not yet
+        produced an authoritative visible advance (AWAITING_ADVANCE), or a
+        confirmation that could not be judged reliably (formatter failure).
+        This is an observation/event counter: the same action may later
+        also be recorded as CONFIRMED once the world advances."""
         self.game_action_unconfirmable_count += 1
 
     def record_game_action(self, *, from_plan: bool = True) -> None:

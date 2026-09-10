@@ -22,6 +22,12 @@ class CheckpointReason(str, Enum):
     NEW_TURN = "NEW_TURN"
     HAND_CHANGED = "HAND_CHANGED"
     ACTION_REJECTED = "ACTION_REJECTED"
+    # The bridge accepted the gameplay command, but the newest authoritative
+    # human-visible state has not advanced yet (turn switch animation,
+    # native modal about to appear, ...). This is a WAITING state, NOT a
+    # rejection: the in-flight action must be retained and reconciled
+    # against a LATER state.
+    AWAITING_ADVANCE = "AWAITING_ADVANCE"
     PLAN_COMPLETE = "PLAN_COMPLETE"
     CARD_GONE = "CARD_GONE"
     TARGET_GONE = "TARGET_GONE"
@@ -99,11 +105,18 @@ def evaluate_after_action(
     chunk: ActionChunk,
     executed_action: PlannedAction,
     next_action: PlannedAction | None,
+    bridge_accepted: bool = False,
 ) -> tuple[CheckpointDecision, StateDelta]:
     """Evaluate only epistemic/protocol continuity.
 
     Caller still performs authoritative validate_action() immediately before
     sending the next bridge action.
+
+    ``bridge_accepted`` is the caller's evidence that the bridge/game really
+    took the gameplay command (its result string marked it accepted). It is
+    used HERE, before any executor mutation, so an action-relevantly
+    unchanged snapshot can be classified as AWAITING_ADVANCE (accepted, not
+    yet observable) instead of ACTION_REJECTED (never accepted).
     """
     delta = diff_states(before, after)
     stype = str(after.get("type", ""))
@@ -116,8 +129,20 @@ def evaluate_after_action(
 
     if delta.action_relevant_same:
         # A normal card play should remove/move the card or otherwise change
-        # action-relevant visible state.  Replaying blindly is more dangerous
-        # than a conservative checkpoint.
+        # action-relevant visible state. Replaying blindly is more dangerous
+        # than a conservative checkpoint -- but ONLY when the bridge did not
+        # confirm acceptance. An accepted command whose visible effect has
+        # not surfaced yet is a genuine WAITING state.
+        if bridge_accepted:
+            return (
+                CheckpointDecision(
+                    True,
+                    CheckpointReason.AWAITING_ADVANCE,
+                    "bridge accepted the command; authoritative state has"
+                    " not advanced yet",
+                ),
+                delta,
+            )
         return (
             CheckpointDecision(
                 True,

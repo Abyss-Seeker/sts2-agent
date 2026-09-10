@@ -335,7 +335,8 @@ def test_duplicate_cards_resolve_after_shift():
     assert ev.prepared.bridge_action["card_index"] == 0
 
 
-def test_unchanged_state_means_rejected_do_not_replay():
+def test_unchanged_state_without_bridge_accept_is_rejected_do_not_replay():
+    """Bridge did NOT accept the command + unchanged state => REJECTED."""
     s0 = combat_state(
         request_id="r0",
         energy=3,
@@ -353,13 +354,76 @@ def test_unchanged_state_means_rejected_do_not_replay():
     ev = ex.prepare_next(s0, validate_action)
     ex.mark_sent(ev.prepared, s0)
 
-    # Same visible state, different request id => treat as rejected.
+    # Same visible state, different request id, NO bridge acceptance.
     s1 = dict(s0)
     s1["request_id"] = "r1"
-    ev = ex.accept_state(s1)
+    ev = ex.accept_state(s1)  # bridge_accepted defaults to False
     assert ev.status == ExecutorStatus.NEED_MODEL
     assert ev.checkpoint.reason == CheckpointReason.ACTION_REJECTED
     assert not ex.has_pending_plan
+
+
+def test_unchanged_state_with_bridge_accept_is_awaiting_advance():
+    """Bridge ACCEPTED the command + unchanged state => AWAITING_ADVANCE:
+    the in-flight step/plan are RETAINED (no advance, no reset), and a later
+    authoritative advance confirms the SAME command exactly once."""
+    s0 = combat_state(
+        request_id="r0",
+        energy=3,
+        hand=[card("STRIKE", target="AnyEnemy"), card("DEFEND")],
+    )
+    chunk = parse_action_chunk(
+        {
+            "thought": "Strike, then defend.",
+            "actions": [
+                {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
+                {"kind": "play", "card_ref": "h1"},
+            ],
+        },
+        s0,
+    )
+    ex = ActionChunkExecutor()
+    ex.submit(chunk)
+    ev = ex.prepare_next(s0, validate_action)
+    ex.mark_sent(ev.prepared, s0)
+
+    # Accepted but the visible world has not moved: WAIT, do not reset.
+    s1 = dict(s0)
+    s1["request_id"] = "r1"
+    ev = ex.accept_state(s1, bridge_accepted=True)
+    assert ev.status == ExecutorStatus.WAITING_ADVANCE, ev
+    assert ev.checkpoint.reason == CheckpointReason.AWAITING_ADVANCE
+    assert ex.inflight is not None
+    assert ex.has_pending_plan
+    assert ex.index == 0
+
+    # The authoritative world finally advances -> the ORIGINAL in-flight
+    # action is confirmed and the chunk continues to its committed step 2.
+    s2 = combat_state(
+        request_id="r2",
+        energy=2,
+        hand=[card("DEFEND")],
+        enemies=[{
+            "id": "CULTIST",
+            "hp": 34,
+            "max_hp": 48,
+            "block": 0,
+            "is_alive": True,
+            "intent": "ATTACK",
+            "intent_damage": 6,
+            "intent_hits": 1,
+        }],
+        discard_count=1,
+    )
+    ev = ex.accept_state(s2, bridge_accepted=True)
+    assert ev.status == ExecutorStatus.READY_ACTION, ev
+    assert ex.index == 1
+    ev = ex.prepare_next(s2, validate_action)
+    assert ev.prepared.bridge_action == {
+        "action": "play",
+        "card_index": 0,
+        "target_index": -1,
+    }
 
 
 def test_model_requested_checkpoint():
@@ -505,7 +569,8 @@ def run_all():
         test_draw_causes_checkpoint,
         test_target_gone_causes_checkpoint,
         test_duplicate_cards_resolve_after_shift,
-        test_unchanged_state_means_rejected_do_not_replay,
+        test_unchanged_state_without_bridge_accept_is_rejected_do_not_replay,
+        test_unchanged_state_with_bridge_accept_is_awaiting_advance,
         test_model_requested_checkpoint,
         test_parser_rejects_actions_after_checkpoint,
         test_delta_render,

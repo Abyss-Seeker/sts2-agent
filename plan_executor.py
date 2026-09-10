@@ -38,6 +38,12 @@ class ExecutorStatus(str, Enum):
     NEED_MODEL = "NEED_MODEL"
     READY_ACTION = "READY_ACTION"
     WAITING_RESULT = "WAITING_RESULT"
+    # Genuine in-flight/control-flow state: the bridge ACCEPTED the sent
+    # command but the newest authoritative visible state has not advanced
+    # yet. The in-flight step and the plan are RETAINED; the caller must
+    # simply wait for another authoritative state -- never re-prompt the
+    # model, never reset the chunk, never send another gameplay action.
+    WAITING_ADVANCE = "WAITING_ADVANCE"
     TERMINAL = "TERMINAL"
 
 
@@ -236,12 +242,21 @@ class ActionChunkExecutor:
     def accept_state(
         self,
         after_state: dict[str, Any],
+        *,
+        bridge_accepted: bool = False,
     ) -> ExecutorEvent:
         """Reconcile the next authoritative bridge state after one send.
 
         If no checkpoint is needed, returns READY_ACTION only indirectly:
         caller should invoke prepare_next(after_state, validate_action).
         This separation keeps validation at the latest authoritative state.
+
+        ``bridge_accepted`` must be the caller's evidence that the bridge
+        really took the sent command. It is REQUIRED to distinguish a real
+        rejection from an accepted-but-not-yet-observable action. The
+        executor owns that classification (and therefore the mutation
+        decision) so it can NEVER irreversibly reset a plan that is merely
+        waiting for the authoritative world to advance.
         """
         if self._inflight is None or self._before_state is None or self.chunk is None:
             return ExecutorEvent(
@@ -268,10 +283,23 @@ class ActionChunkExecutor:
             chunk=self.chunk,
             executed_action=executed.planned,
             next_action=next_action,
+            bridge_accepted=bridge_accepted,
         )
         chunk_exhausted = next_index >= len(self.chunk.actions)
 
-        # Clear in-flight tracking before any return.
+        if checkpoint.reason is CheckpointReason.AWAITING_ADVANCE:
+            # ACCEPTED BUT NOT YET OBSERVABLY ADVANCED is a WAITING state.
+            # Retain the in-flight step AND the original before-state so the
+            # SAME command can be reconciled against a later authoritative
+            # state. Do NOT advance the index, do NOT reset the chunk.
+            return ExecutorEvent(
+                ExecutorStatus.WAITING_ADVANCE,
+                checkpoint=checkpoint,
+                prepared=executed,
+                detail="bridge accepted; awaiting authoritative advance",
+            )
+
+        # Clear in-flight tracking before any resolving return.
         self._inflight = None
         self._before_state = None
 

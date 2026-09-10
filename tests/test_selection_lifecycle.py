@@ -6,6 +6,11 @@ preempt the underlying combat state, must never be classified as
 ACTION_REJECTED, must discard the old ActionChunk remainder, and repeated
 identical rejections must raise PROTOCOL_STALL instead of looping.
 
+It also covers the accepted-but-not-yet-advanced (AWAITING_ADVANCE) waiting
+state: an accepted command whose snapshot has not moved must RETAIN its
+in-flight action/plan (no reset, no advance) and reconcile the SAME command
+against a later authoritative state.
+
 Run: python tests/test_selection_lifecycle.py
 """
 
@@ -92,6 +97,88 @@ class TestSelectionClassification(unittest.TestCase):
         self.assertEqual(s._metrics.game_action_confirmed_count, 1)
         self.assertEqual(s._metrics.game_action_rejected_count, 0)
         self.assertEqual(s._last_checkpoint_reason, "SELECTION_REQUIRED")
+
+
+class TestAwaitingAdvanceLifecycle(unittest.TestCase):
+    """P0: accepted-but-not-yet-observably-advanced is a WAITING state.
+
+    The in-flight action/plan must be retained, and the no-advance stall guard
+    must key on the ACTUAL unresolved action (not ``_pending_single_action``,
+    which is None in ActionChunk mode).
+    """
+
+    def _executor_with_plan(self, s0):
+        from action_plan import parse_action_chunk
+        from plan_executor import ActionChunkExecutor
+
+        chunk = parse_action_chunk({
+            "thought": "headbutt then end",
+            "actions": [
+                {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
+                {"kind": "end_turn"},
+            ],
+        }, s0, max_actions=8)
+        ex = ActionChunkExecutor()
+        ex.submit(chunk)
+        ev = ex.prepare_next(s0, agent_mod.validate_action)
+        ex.mark_sent(ev.prepared, s0)
+        return ex
+
+    def test_awaiting_advance_retains_inflight_then_selection_preempts(self):
+        from plan_executor import ExecutorStatus
+
+        s0 = combat_state("S0", energy=3, hand=[
+            card("HEADBUTT", target="AnyEnemy"),
+            card("STRIKE", target="AnyEnemy")])
+        ex = self._executor_with_plan(s0)
+        # Accepted, unchanged combat snapshot -> WAITING_ADVANCE (retained).
+        event = ex.accept_state(
+            combat_state("S1", energy=3, hand=[
+                card("HEADBUTT", target="AnyEnemy"),
+                card("STRIKE", target="AnyEnemy")]),
+            bridge_accepted=True,
+        )
+        self.assertEqual(event.status, ExecutorStatus.WAITING_ADVANCE)
+        self.assertIsNotNone(ex.inflight)
+        self.assertTrue(ex.has_pending_plan)
+        self.assertEqual(ex.index, 0)
+
+        # The native selection then arrives: it resolves the SAME in-flight
+        # action as a screen change and discards the stale remainder.
+        event = ex.accept_state(selection_state("SEL"), bridge_accepted=True)
+        self.assertEqual(event.status, ExecutorStatus.NEED_MODEL)
+        self.assertIn(event.checkpoint.reason.value,
+                      ("SCREEN_CHANGED", "SELECTION_REQUIRED"))
+        self.assertFalse(ex.has_pending_plan)
+
+    def test_no_advance_key_uses_actual_inflight_action(self):
+        import dataclasses
+
+        s = AgentSession()
+        s._metrics = BenchmarkMetrics()
+        s._logs = []
+        s._stop = agent_mod.threading.Event()
+        s0 = combat_state("S0", energy=3, hand=[
+            card("HEADBUTT", target="AnyEnemy"),
+            card("STRIKE", target="AnyEnemy")])
+        ex = self._executor_with_plan(s0)
+        s._plan_executor = ex
+        state = combat_state("S1", energy=3, hand=[
+            card("HEADBUTT", target="AnyEnemy"),
+            card("STRIKE", target="AnyEnemy")])
+
+        s._on_no_advance(state)
+        self.assertEqual(s._no_advance_streak, 1)
+        first_key = s._no_advance_key
+        self.assertNotIn("None", first_key)
+
+        # SAME visible fingerprint, DIFFERENT unresolved action -> the streak
+        # must restart (the key uses the real in-flight bridge action).
+        ex._inflight = dataclasses.replace(
+            ex.inflight, bridge_action={"action": "end_turn"})
+        s._on_no_advance(state)
+        self.assertNotEqual(s._no_advance_key, first_key)
+        self.assertEqual(s._no_advance_streak, 1)
 
 
 class TestProtocolStallGuard(unittest.TestCase):

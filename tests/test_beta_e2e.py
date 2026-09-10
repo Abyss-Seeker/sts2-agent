@@ -15,8 +15,19 @@ Acceptance tests (review-remediated semantics):
           noncombat choice path; no stale combat action is executed.
   TEST 4  lethal action followed by reward_screen: in-flight action
           confirmed and the chunk exhausted -> plan COMPLETED.
-  TEST 5  unchanged state after play: sent += 1, confirmed += 0,
-          rejected += 1, no automatic replay.
+  TEST 5 (P0) bridge ACCEPTED + action-relevantly UNCHANGED state:
+          sent += 1, confirmed += 0, rejected += 0, unconfirmable += 1,
+          the chunk is RETAINED, no re-prompt and no second gameplay
+          action (AWAITING_ADVANCE is a waiting state, not a rejection).
+  TEST 5b accepted + unchanged, THEN card_select: the selection preempts
+          combat, the triggering action is not rejected, the stale chunk
+          remainder is discarded, and no LLM call happened at the unchanged
+          snapshot.
+  TEST 5c accepted + unchanged, THEN normal advance: the SAME in-flight
+          action is confirmed exactly once and the chunk continues.
+  TEST 5d explicit bridge rejection (no acceptance marker) is still a real
+          rejection.
+  TEST 5e repeated accepted + unchanged -> bounded PROTOCOL_STALL.
   TEST 6  API timeout (strict): llm_request_count and
           llm_failed_request_count increase, benchmark invalid, ZERO
           fallback strategic actions.
@@ -36,8 +47,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import agent as agent_mod
-from agent import AgentSession
+from agent import AgentSession, PROTOCOL_STALL_REPEATS
+from action_plan import parse_action_chunk
+from benchmark_metrics import BenchmarkMetrics
+from checkpoint import CheckpointReason
 from llm_client import LLMError
+from plan_executor import ExecutorStatus
 
 
 # ----------------------------------------------------------------
@@ -113,13 +128,28 @@ def reward_screen_state(request_id: str) -> dict:
     }
 
 
-class FakeBridge(threading.Thread):
-    """Sends a scripted list of states, collecting the agent's actions."""
+_TIMEOUT = object()
 
-    def __init__(self, port: int, states: list[dict]):
+
+class FakeBridge(threading.Thread):
+    """Sends a scripted list of states, collecting the agent's actions.
+
+    ``action_wait`` (seconds) models the asynchronous lifecycle:
+      - None (default): after each state, block until the agent's gameplay
+        action arrives (strict one-state/one-action handshake).
+      - float: push the NEXT authoritative state after waiting AT MOST
+        ``action_wait`` seconds for an action. This is REQUIRED for
+        accepted-but-not-yet-advanced lifecycles, where one gameplay
+        command legitimately produces several authoritative observations
+        and the harness sends NO action for the unchanged ones.
+    """
+
+    def __init__(self, port: int, states: list[dict], *,
+                 action_wait: float | None = None):
         super().__init__(daemon=True)
         self.port = port
         self.states = states
+        self.action_wait = action_wait
         self.actions: list[dict] = []
         self.error: str | None = None
 
@@ -136,10 +166,14 @@ class FakeBridge(threading.Thread):
         def send(obj: dict) -> None:
             conn.sendall(json.dumps(obj).encode() + b"\n")
 
-        def recv() -> dict | None:
+        def recv(timeout: float | None = None):
             nonlocal buf
+            conn.settimeout(20 if timeout is None else timeout)
             while b"\n" not in buf:
-                chunk = conn.recv(4096)
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    return _TIMEOUT
                 if not chunk:
                     return None
                 buf += chunk
@@ -153,13 +187,28 @@ class FakeBridge(threading.Thread):
             assert a and a.get("action") == "set_agent_timeout", a
             for st in self.states:
                 send(st)
+                deadline = (
+                    None if self.action_wait is None
+                    else time.time() + self.action_wait
+                )
                 # Drain protocol control commands (set_fallback/
                 # set_agent_timeout/set_headful/set_fast_mode) until the
                 # actual game action for this state arrives.
                 while True:
-                    a = recv()
+                    if deadline is None:
+                        a = recv()
+                    else:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            break
+                        a = recv(timeout=remaining)
                     if a is None:
                         return
+                    if a is _TIMEOUT:
+                        # No action for this state (accepted-but-not-yet-
+                        # advanced): move on to the NEXT authoritative
+                        # state WITHOUT requiring a gameplay action.
+                        break
                     # bridge_client auto-attaches the state's request_id;
                     # strip it so assertions stay on the action payload.
                     a.pop("request_id", None)
@@ -203,8 +252,8 @@ class MockLLM(agent_mod.LLMClient):
 
 
 def run_agent(port: int, llm_cls, cfg: dict | None = None,
-              states: list[dict] | None = None):
-    bridge = FakeBridge(port, states or [])
+              states: list[dict] | None = None, bridge_wait: float | None = None):
+    bridge = FakeBridge(port, states or [], action_wait=bridge_wait)
     bridge.start()
 
     agent_mod.LLMClient = llm_cls
@@ -253,6 +302,13 @@ CHUNK_POMMEL = json.dumps({
 CHUNK_STRIKE_ONCE = json.dumps({
     "thought": "strike once",
     "actions": [{"kind": "play", "card_ref": "h0", "target_ref": "e0"}],
+})
+CHUNK_STRIKE_END = json.dumps({
+    "thought": "strike then end the turn",
+    "actions": [
+        {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
+        {"kind": "end_turn"},
+    ],
 })
 CHUNK_STRIKE_INSPECT = json.dumps({
     "thought": "play once, then inspect",
@@ -448,38 +504,203 @@ def test_lethal_action_reward_screen_plan_completed() -> None:
 
 
 # ----------------------------------------------------------------
-# TEST 5 — unchanged state after play: sent/confirmed/rejected split
+# TEST 5 (P0) — bridge accepted + unchanged: WAIT, never re-prompt
 # ----------------------------------------------------------------
 
-def test_rejected_action_no_replay() -> None:
+def test_accepted_no_advance_does_not_reprompt() -> None:
+    """KEY REGRESSION: an accepted command whose authoritative snapshot has
+    not advanced is a WAITING state. Exactly ONE cognition, ONE gameplay
+    command, the chunk RETAINED -- never a rejection and never a re-prompt
+    against the stale combat snapshot."""
     class LLM(MockLLM):
-        script = [CHUNK_STRIKE_ONCE, CHUNK_END_TURN]
+        script = [CHUNK_STRIKE_DEFEND_END]
 
-    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
-    # Same visible state, new request_id -> the mod rejected the action.
-    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s0 = combat_state("r0", energy=3,
+                      hand=[card("STRIKE", target="AnyEnemy"), card("DEFEND")])
+    # Human-visibly IDENTICAL state, only request_id differs.
+    s1 = combat_state("r1", energy=3,
+                      hand=[card("STRIKE", target="AnyEnemy"), card("DEFEND")])
 
-    s, bridge = run_agent(9123, LLM, states=[s0, s1])
+    s, bridge = run_agent(9123, LLM, states=[s0, s1], bridge_wait=0.6)
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
 
-    plays = [a for a in bridge.actions if a.get("action") == "play"]
-    assert len(plays) == 1, bridge.actions  # never replayed blindly
-    assert bridge.actions[-1] == {"action": "end_turn"}, bridge.actions
-    assert st["llm_request_count"] == 2, st
-    # SENT vs CONFIRMED vs REJECTED: the play was sent once and REJECTED
-    # (confirmed += 0); the follow-up end_turn was sent but its
-    # confirming state never arrived (fake bridge closes).
-    assert st["game_action_sent_count"] == 2, st
+    # EXACTLY one gameplay command ever sent: no end_turn / potion poke.
+    assert bridge.actions == [
+        {"action": "play", "card_index": 0, "target_index": 0},
+    ], bridge.actions
+    assert st["game_action_sent_count"] == 1, st
     assert st["game_action_confirmed_count"] == 0, st
-    # §27 three-way classification: the bridge ACCEPTED the play
-    # ("played card 0") but the authoritative snapshot never advanced, so
-    # it is ACCEPTED-but-no-advance -> UNCONFIRMABLE, not REJECTED.
-    # Never counted as confirmed; never replayed.
+    assert st["game_action_rejected_count"] == 0, st
     assert st["game_action_unconfirmable_count"] >= 1, st
-    assert st["last_checkpoint_reason"] == "ACTION_REJECTED", st
-    print("PASS TEST 5 rejected_action_no_replay")
+    # ONE cognition: the unchanged snapshot must NOT re-prompt the model.
+    assert st["llm_request_count"] == 1, st
+    assert st["last_checkpoint_reason"] == "AWAITING_ADVANCE", st
+    # The executor RETAINS the unresolved original action and its plan.
+    assert s._plan_executor.inflight is not None
+    assert s._plan_executor.has_pending_plan
+    assert s._plan_executor.index == 0
+    print("PASS TEST 5 accepted_no_advance_does_not_reprompt")
+
+
+# ----------------------------------------------------------------
+# TEST 5b — accepted + unchanged, THEN native card_select
+# ----------------------------------------------------------------
+
+def test_accepted_no_advance_then_native_selection() -> None:
+    """Headbutt-class lifecycle: an accepted command first yields an
+    unchanged combat snapshot, then the native card_select. The selection
+    must own the next cognition; the triggering action must not be
+    rejected and the stale chunk remainder must be discarded."""
+    class LLM(MockLLM):
+        script = [
+            json.dumps({
+                "thought": "headbutt then end",
+                "actions": [
+                    {"kind": "play", "card_ref": "h0", "target_ref": "e0"},
+                    {"kind": "end_turn"},
+                ],
+            }),
+            CHOOSE_0,
+        ]
+
+    s0 = combat_state("r0", energy=3, hand=[
+        card("HEADBUTT", target="AnyEnemy"), card("STRIKE", target="AnyEnemy")])
+    # Accepted but not yet observably advanced.
+    s1 = combat_state("r1", energy=3, hand=[
+        card("HEADBUTT", target="AnyEnemy"), card("STRIKE", target="AnyEnemy")])
+    s2 = card_select_state("r2")
+
+    s, bridge = run_agent(9133, LLM, states=[s0, s1, s2], bridge_wait=0.6)
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    assert bridge.actions == [
+        {"action": "play", "card_index": 0, "target_index": 0},
+        {"action": "choose", "index": 0},
+    ], bridge.actions
+    # Exactly TWO cognitions: the plan, then the selection decision. The
+    # unchanged snapshot produced NO extra prompt.
+    assert st["llm_request_count"] == 2, st
+    # The triggering action was NOT rejected.
+    assert st["game_action_rejected_count"] == 0, st
+    assert st["game_action_confirmed_count"] >= 1, st
+    # The stale chunk remainder (end_turn) is gone, never executed.
+    assert not any(a.get("action") == "end_turn" for a in bridge.actions)
+    assert st["plan_interrupted_count"] == 1, st
+    logs = s.logs_since(0)
+    cps = [e for e in logs if e["kind"] == "plan_checkpoint"
+           and e.get("reason") == "SCREEN_CHANGED"]
+    assert cps and cps[0].get("remaining_steps_discarded") == 1, cps
+    # The selection screen got foreground ownership (normal choose path).
+    assert any(e["kind"] == "decision" and e.get("state_type") == "card_select"
+               for e in logs), logs
+    print("PASS TEST 5b accepted_no_advance_then_native_selection")
+
+
+# ----------------------------------------------------------------
+# TEST 5c — accepted + unchanged, THEN normal advance: confirm once
+# ----------------------------------------------------------------
+
+def test_accepted_no_advance_then_normal_advance() -> None:
+    class LLM(MockLLM):
+        script = [CHUNK_STRIKE_END]
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    # Accepted but unchanged.
+    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    # The visible world finally advances: energy down, enemy hp down,
+    # Strike left the hand.
+    s2 = combat_state("r2", energy=2, hand=[], enemies=[cultist(34)],
+                      discard_count=1)
+
+    s, bridge = run_agent(9134, LLM, states=[s0, s1, s2], bridge_wait=0.6)
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    # No extra action at S1; at S2 the SAME in-flight action was confirmed
+    # and the chunk continued with its committed end_turn.
+    assert bridge.actions == [
+        {"action": "play", "card_index": 0, "target_index": 0},
+        {"action": "end_turn"},
+    ], bridge.actions
+    assert st["llm_request_count"] == 1, st
+    assert st["game_action_confirmed_count"] == 1, st
+    assert st["game_action_rejected_count"] == 0, st
+    assert st["game_action_sent_count"] == 2, st
+    # The S1 observation is a transient awaiting observation (observation
+    # counter), NOT a second final outcome.
+    assert st["game_action_unconfirmable_count"] >= 1, st
+    print("PASS TEST 5c accepted_no_advance_then_normal_advance")
+
+
+# ----------------------------------------------------------------
+# TEST 5d — a genuinely REJECTED command is still rejected
+# ----------------------------------------------------------------
+
+def test_explicit_bridge_rejection_is_rejected() -> None:
+    """No bridge acceptance marker + action-relevantly unchanged state =>
+    a REAL rejection: rejected += 1, unconfirmable unchanged, plan reset so
+    fresh cognition is permitted."""
+    s = AgentSession()
+    s._metrics = BenchmarkMetrics()
+    s._logs = []
+    s._stop = threading.Event()
+    s._pending_action_result = ""  # bridge reported NO acceptance
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    chunk = parse_action_chunk({
+        "thought": "strike once",
+        "actions": [{"kind": "play", "card_ref": "h0", "target_ref": "e0"}],
+    }, s0, max_actions=8)
+    ex = s._plan_executor
+    ex.submit(chunk)
+    ev = ex.prepare_next(s0, agent_mod.validate_action)
+    ex.mark_sent(ev.prepared, s0)
+
+    event = s._reconcile_inflight_if_any(s1)
+    assert event.status == ExecutorStatus.NEED_MODEL, event
+    assert event.checkpoint.reason == CheckpointReason.ACTION_REJECTED, event
+    assert s._metrics.game_action_rejected_count == 1
+    assert s._metrics.game_action_unconfirmable_count == 0
+    assert not ex.has_pending_plan
+    print("PASS TEST 5d explicit_bridge_rejection_is_rejected")
+
+
+# ----------------------------------------------------------------
+# TEST 5e — repeated accepted + unchanged -> bounded PROTOCOL_STALL
+# ----------------------------------------------------------------
+
+def test_bounded_stall_on_repeated_accepted_no_advance() -> None:
+    class LLM(MockLLM):
+        script = [CHUNK_STRIKE_ONCE]
+
+    s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
+    repeats = [
+        combat_state(f"r{i}", energy=3,
+                     hand=[card("STRIKE", target="AnyEnemy")])
+        for i in range(1, PROTOCOL_STALL_REPEATS + 1)
+    ]
+
+    s, bridge = run_agent(9132, LLM, states=[s0] + repeats, bridge_wait=0.4)
+    wait_until(lambda: not s.status()["running"])
+    time.sleep(0.3)
+    st = s.status()
+
+    # No strategic action was ever emitted to "poke" the state forward.
+    assert bridge.actions == [
+        {"action": "play", "card_index": 0, "target_index": 0},
+    ], bridge.actions
+    assert st["llm_request_count"] == 1, st
+    assert st["game_action_sent_count"] == 1, st
+    assert st["benchmark_valid"] is False, st
+    assert "PROTOCOL_STALL" in st["invalidation_reason"], st
+    assert s._stop.is_set()
+    print("PASS TEST 5e bounded_stall_on_repeated_accepted_no_advance")
 
 
 # ----------------------------------------------------------------
@@ -542,41 +763,39 @@ def test_single_action_confirmed_by_next_state() -> None:
     print("PASS single_action_confirmed_by_next_state")
 
 
-def test_single_action_rejected_by_unchanged_state() -> None:
+def test_single_action_accepted_no_advance_waits() -> None:
+    """Single-action mode: an ACCEPTED command whose snapshot is unchanged
+    is a WAITING state -- no second cognition, no second gameplay action,
+    and the pending action is retained for later reconciliation."""
     class LLM(MockLLM):
         script = [
             json.dumps({"thought": "hit it",
                         "action": "play", "card_index": 0, "target_index": 0}),
-            json.dumps({"thought": "model re-consulted", "action": "end_turn"}),
+            json.dumps({"thought": "must never be asked", "action": "end_turn"}),
         ]
 
     s0 = combat_state("r0", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
-    # Human-visibly IDENTICAL state, only request_id differs => the game
-    # did not accept the action.
+    # Human-visibly IDENTICAL state, only request_id differs; the bridge
+    # ACCEPTED the play ("played card 0").
     s1 = combat_state("r1", energy=3, hand=[card("STRIKE", target="AnyEnemy")])
 
     s, bridge = run_agent(9129, LLM, cfg={"decision_mode": "single_action"},
-                          states=[s0, s1])
+                          states=[s0, s1], bridge_wait=0.6)
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
 
-    # The unchanged state triggers a fresh LLM decision (no replay loop).
-    assert bridge.actions[0] == {"action": "play", "card_index": 0,
-                                 "target_index": 0}
-    assert bridge.actions[-1] == {"action": "end_turn"}, bridge.actions
-    assert st["llm_request_count"] == 2, st
-    # §27 three-way classification for the first action: the bridge ACCEPTED
-    # the play ("played card 0") but the authoritative snapshot never advanced
-    # (s1 is human-visibly identical to s0), so it is ACCEPTED-but-no-advance
-    # -> UNCONFIRMABLE, never REJECTED. (The second re-prompted end_turn was
-    # sent too but its confirming state never arrived -- the fake bridge
-    # closes -- so it also stays unconfirmable.)
-    assert st["game_action_sent_count"] == 2, st
+    # Exactly one gameplay command was ever sent (no poked end_turn).
+    assert bridge.actions == [{"action": "play", "card_index": 0,
+                               "target_index": 0}], bridge.actions
+    assert st["llm_request_count"] == 1, st
+    assert st["game_action_sent_count"] == 1, st
     assert st["game_action_confirmed_count"] == 0, st
     assert st["game_action_rejected_count"] == 0, st
     assert st["game_action_unconfirmable_count"] >= 1, st
-    print("PASS single_action_rejected_by_unchanged_state")
+    # The pending single action is RETAINED for later reconciliation.
+    assert s._pending_single_action is not None
+    print("PASS single_action_accepted_no_advance_waits")
 
 
 # ----------------------------------------------------------------
@@ -648,30 +867,31 @@ def test_chunk_mode_noncombat_action_is_confirmed() -> None:
     print("PASS chunk_mode_noncombat_action_is_confirmed")
 
 
-def test_chunk_mode_noncombat_rejected_by_unchanged_state() -> None:
+def test_chunk_mode_noncombat_accepted_no_advance_waits() -> None:
+    """In action_chunk mode non-combat screens use the single-action path;
+    an ACCEPTED choose whose event snapshot is unchanged must WAIT (no
+    second cognition, no second choose), not be re-prompted."""
     class LLM(MockLLM):
         script = [
             json.dumps({"thought": "leave", "action": "choose", "index": 0}),
-            json.dumps({"thought": "try again", "action": "choose", "index": 0}),
+            json.dumps({"thought": "must never be asked",
+                        "action": "choose", "index": 0}),
         ]
 
     s0 = event_state("r0", "Take the gold")
     s1 = event_state("r1", "Take the gold")  # IDENTICAL visible state
 
-    s, bridge = run_agent(9131, LLM, states=[s0, s1])
+    s, bridge = run_agent(9131, LLM, states=[s0, s1], bridge_wait=0.6)
     wait_until(lambda: not s.status()["running"])
     time.sleep(0.3)
     st = s.status()
 
-    # §27 three-way classification: the bridge ACCEPTED the choose
-    # ("chose ...") but the authoritative event snapshot never advanced (s1 is
-    # human-visibly identical to s0), so it is ACCEPTED-but-no-advance ->
-    # UNCONFIRMABLE, never REJECTED (no silent confirmation, no infinite
-    # retry loop without accounting).
+    assert bridge.actions == [{"action": "choose", "index": 0}], bridge.actions
+    assert st["llm_request_count"] == 1, st
     assert st["game_action_rejected_count"] == 0, st
     assert st["game_action_unconfirmable_count"] >= 1, st
     assert st["game_action_confirmed_count"] == 0, st
-    print("PASS chunk_mode_noncombat_rejected_by_unchanged_state")
+    print("PASS chunk_mode_noncombat_accepted_no_advance_waits")
 
 
 def run_all() -> None:
@@ -680,13 +900,17 @@ def run_all() -> None:
         test_draw_checkpoint_reprompt_contains_full_new_card_information,
         test_screen_change_reconciles_inflight_before_routing,
         test_lethal_action_reward_screen_plan_completed,
-        test_rejected_action_no_replay,
+        test_accepted_no_advance_does_not_reprompt,
+        test_accepted_no_advance_then_native_selection,
+        test_accepted_no_advance_then_normal_advance,
+        test_explicit_bridge_rejection_is_rejected,
+        test_bounded_stall_on_repeated_accepted_no_advance,
         test_explicit_checkpoint,
         test_strict_failure,
         test_single_action_confirmed_by_next_state,
-        test_single_action_rejected_by_unchanged_state,
+        test_single_action_accepted_no_advance_waits,
         test_chunk_mode_noncombat_action_is_confirmed,
-        test_chunk_mode_noncombat_rejected_by_unchanged_state,
+        test_chunk_mode_noncombat_accepted_no_advance_waits,
     ]
     for fn in tests:
         fn()

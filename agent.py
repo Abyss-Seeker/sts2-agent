@@ -1194,13 +1194,20 @@ class AgentSession:
                     # checkpoint-logged and the plan finalized BEFORE
                     # routing decides anything.
                     reconcile_event = self._reconcile_inflight_if_any(state)
+                    if reconcile_event.status == ExecutorStatus.WAITING_ADVANCE:
+                        # ACCEPTED BUT NOT YET OBSERVABLY ADVANCED: WAIT for
+                        # the next authoritative state. Never re-prompt the
+                        # model and never send another gameplay action just to
+                        # force the visible world to move.
+                        continue
                 # Single-action sends happen in BOTH modes (action_chunk
                 # uses the single path for every non-combat screen), so
                 # reconcile a pending single action whenever one exists --
                 # otherwise non-combat actions are never confirmed and a
                 # rejected option loops forever (found in real-game smoke).
                 if self._pending_single_action is not None:
-                    self._reconcile_pending_single_action(state)
+                    if self._reconcile_pending_single_action(state):
+                        continue
 
                 # Step B: route the newly observed screen.
                 stype = str(state.get("type", "unknown"))
@@ -1367,6 +1374,13 @@ class AgentSession:
         executor.reset()
         self._pending_single_action = None
         self._pending_single_before_state = None
+        self._pending_action_result = ""
+        # A reconnect is a clean lifecycle boundary: the stall guards must
+        # not carry a stale streak across it.
+        self._reject_streak = 0
+        self._reject_streak_key = None
+        self._no_advance_streak = 0
+        self._no_advance_key = None
         self._plan_executed = []
         self._current_plan_id = ""
         self._current_plan_step = 0
@@ -1763,14 +1777,31 @@ class AgentSession:
         the previously sent plan action, whatever screen the new state
         shows. Returns the ExecutorEvent (never None when called).
 
-        Action accounting: the sent action is either CONFIRMED by the
-        authoritative next state (the visible world moved forward --
-        screen changes / new turns / terminal all count) or REJECTED
-        (action-relevantly unchanged state). A connection lost before the
-        next state is never counted as confirmed.
+        Three-way outcome (the executor owns classification):
+          CONFIRMED         -- the visible world moved forward.
+          AWAITING_ADVANCE  -- bridge accepted, world not advanced yet; the
+                               in-flight action is RETAINED and the caller
+                               must simply wait for another state.
+          REJECTED          -- the game/bridge did NOT accept the command.
+        A connection lost before the next state is never counted as
+        confirmed.
         """
         executor = self._plan_executor
-        event = executor.accept_state(state)
+        event = executor.accept_state(
+            state,
+            bridge_accepted=_bridge_accepted(self._pending_action_result),
+        )
+        self._classify_inflight_reconcile(state, event)
+        return event
+
+    def _classify_inflight_reconcile(
+        self, state: dict[str, Any], event: Any
+    ) -> None:
+        """Classify ONE in-flight reconciliation event and record metrics.
+
+        Shared by the main-loop Step A and by the defensive reconcile in
+        _handle_combat_chunk_state so both agree on the three-way outcome.
+        """
         stype = str(state.get("type", ""))
         # §11/§27-B: the action successfully INITIATED a native modal
         # selection (Headbutt discard pick, potion pick, ...). That is a
@@ -1785,36 +1816,74 @@ class AgentSession:
             )
             self._metrics.record_action_confirmed(from_plan=True, combat=True)
             self._reject_streak = 0
+            self._no_advance_streak = 0
+            self._no_advance_key = None
+        elif event.status == ExecutorStatus.WAITING_ADVANCE:
+            # ACCEPTED, NOT YET OBSERVABLY ADVANCED: never confirmed, never
+            # rejected. The executor retains the in-flight action and the
+            # plan; we only record the transient observation (and bound it).
+            self._on_no_advance(state)
         elif (
             event.checkpoint is not None
             and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
         ):
-            if _bridge_accepted(self._pending_action_result):
-                # §27-B: accepted but the world has not advanced yet.
-                self._on_no_advance(state)
-            else:
-                self._metrics.record_action_rejected()
-                self._on_action_rejected(state)
+            self._metrics.record_action_rejected()
+            self._no_advance_streak = 0
+            self._no_advance_key = None
+            self._on_action_rejected(state)
         else:
             self._metrics.record_action_confirmed(from_plan=True, combat=True)
             self._reject_streak = 0
+            self._no_advance_streak = 0
+            self._no_advance_key = None
         self._consume_executor_event(event, state)
-        return event
+
+    def _pending_action_identity(self) -> str:
+        """Deterministic identity of the currently unresolved gameplay
+        action (chunk in-flight step preferred, else a pending single
+        action). Used by the no-advance stall guard so the streak key is
+        built from the ACTUAL unresolved action -- never a fragile object
+        repr or an unrelated ``_pending_single_action`` (which is None in
+        ActionChunk mode)."""
+        executor = self._plan_executor
+        if executor.inflight is not None:
+            p = executor.inflight
+            return json.dumps(
+                {
+                    "plan_id": p.plan_id,
+                    "step_index": p.step_index,
+                    "bridge_action": p.bridge_action,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+        if self._pending_single_action is not None:
+            return json.dumps(
+                self._pending_single_action,
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+        return ""
 
     def _on_no_advance(self, state: dict[str, Any]) -> None:
         """§27-B: the command was accepted but the visible world did not
-        advance. Counted as unconfirmable (never confirmed, never
-        rejected) and bounded: repeating on the same state means the
-        bridge/game lifecycle is stuck (modal/animation/desync)."""
+        advance. Counted as an unconfirmable OBSERVATION (never confirmed,
+        never rejected) and bounded: repeating on the same state + same
+        unresolved action means the bridge/game lifecycle is stuck
+        (modal/animation/desync)."""
         self._metrics.record_action_unconfirmable()
+        self._last_checkpoint_reason = "AWAITING_ADVANCE"
         self._log(
             "warning",
             "ACTION_ACCEPTED_NO_ADVANCE: 命令已被游戏接受但权威状态未推进"
             f"（result={self._pending_action_result!r}）——可能因回合切换/"
-            "动画/模态 UI；不计为 confirmed 也不计为 rejected。",
+            "动画/模态 UI；不计为 confirmed 也不计为 rejected，"
+            "保留原动作继续等待。",
         )
         fp = self._visible_state_fingerprint(state) or "?"
-        key = (fp, str(self._pending_single_action))
+        key = (fp, self._pending_action_identity())
         if key == self._no_advance_key:
             self._no_advance_streak += 1
         else:
@@ -1879,18 +1948,20 @@ class AgentSession:
         # twice -- only fall back to a local reconcile defensively.
         event = reconcile_event
         if event is None and executor.inflight is not None:
-            event = executor.accept_state(state)
-            if (
-                event.checkpoint is not None
-                and event.checkpoint.reason is CheckpointReason.ACTION_REJECTED
-            ):
-                self._metrics.record_action_rejected()
-            else:
-                self._metrics.record_action_confirmed()
-            self._consume_executor_event(event, state)
+            event = executor.accept_state(
+                state,
+                bridge_accepted=_bridge_accepted(self._pending_action_result),
+            )
+            self._classify_inflight_reconcile(state, event)
 
         if event is not None:
             if event.status == ExecutorStatus.TERMINAL:
+                return
+            if event.status == ExecutorStatus.WAITING_ADVANCE:
+                # Accepted but not yet observably advanced: retain the plan
+                # and in-flight step, send NOTHING, and let the next
+                # authoritative state drive reconciliation. Never re-prompt
+                # the model against a stale unchanged snapshot.
                 return
             if event.status == ExecutorStatus.READY_ACTION:
                 # Plan remains epistemically valid: prepare the next
@@ -2251,10 +2322,15 @@ class AgentSession:
         event: Any,
         state: dict[str, Any],
     ) -> None:
-        """Checkpoint logging/metrics/context for executor events."""
+        """Checkpoint logging/metrics/context for executor events.
+
+        WAITING_ADVANCE is NOT a checkpoint/interruption: the plan and its
+        in-flight step are retained, so this must be a pure no-op here.
+        """
         if event.status in (
             ExecutorStatus.READY_ACTION,
             ExecutorStatus.WAITING_RESULT,
+            ExecutorStatus.WAITING_ADVANCE,
         ):
             return
         cp = event.checkpoint
@@ -2834,48 +2910,72 @@ class AgentSession:
             return None
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
-    def _reconcile_pending_single_action(self, state: dict[str, Any]) -> None:
+    def _reconcile_pending_single_action(self, state: dict[str, Any]) -> bool:
         """Confirm/reject the previously sent single action against the
         next authoritative bridge state (main-loop Step A for
-        single_action mode)."""
+        single_action mode).
+
+        Returns True when the action is ACCEPTED-but-not-yet-observably-
+        advanced (AWAITING_ADVANCE): the pending action is RETAINED so the
+        caller must WAIT for another authoritative state instead of
+        routing the stale snapshot to the model.
+        """
         act = self._pending_single_action
         before = self._pending_single_before_state
-        self._pending_single_action = None
-        self._pending_single_before_state = None
         if act is None or before is None:
-            return
+            self._pending_single_action = None
+            self._pending_single_before_state = None
+            return False
         fp_before = self._visible_state_fingerprint(before)
         fp_after = self._visible_state_fingerprint(state)
         if fp_before is None or fp_after is None or not fp_before or not fp_after:
-            # Conservative: never silently claim a confirmation.
+            # Conservative: never silently claim a confirmation. Clear the
+            # pending action (it cannot be reconciled reliably).
+            self._pending_single_action = None
+            self._pending_single_before_state = None
             self._metrics.record_action_unconfirmable()
             self._log(
                 "warning",
                 "UNKNOWN_CONFIRMATION: 无法可靠比较动作前后的可见状态，"
                 "该动作既不计为 confirmed 也不计为 rejected。",
             )
-            return
+            return False
         if str(state.get("type", "")) in SELECTION_SCREEN_TYPES:
             # §11/§27-B: single-action mode -- the action opened a native
             # modal selection; valid advancement, never "unchanged".
+            self._pending_single_action = None
+            self._pending_single_before_state = None
             self._last_checkpoint_reason = "SELECTION_REQUIRED"
             self._metrics.record_action_confirmed(from_plan=False)
             self._reject_streak = 0
-        elif fp_before == fp_after:
+            self._no_advance_streak = 0
+            self._no_advance_key = None
+            return False
+        if fp_before == fp_after:
             if _bridge_accepted(self._pending_action_result):
                 # §27-B: the bridge ACCEPTED the command ("ended turn",
                 # "played card N", ...) but the authoritative snapshot has
                 # not advanced yet (turn switch / animation / modal). That
-                # is NOT a rejection -- do not count it as one and do not
-                # let the model "poke" the state with a resource.
+                # is NOT a rejection -- RETAIN the pending action and wait
+                # for the next authoritative state (never re-prompt, never
+                # "poke" the state with a resource).
                 self._on_no_advance(state)
-                return
-            # Action-relevantly unchanged state => the game did not accept
-            # the action; identical to the chunk ACTION_REJECTED semantics.
+                return True
+            # Action-relevantly unchanged state AND the bridge did not
+            # report acceptance => the game really refused the action.
+            self._pending_single_action = None
+            self._pending_single_before_state = None
             self._metrics.record_action_rejected()
+            self._no_advance_streak = 0
+            self._no_advance_key = None
             self._on_action_rejected(state)
-        else:
-            self._metrics.record_action_confirmed(from_plan=False)
+            return False
+        self._pending_single_action = None
+        self._pending_single_before_state = None
+        self._metrics.record_action_confirmed(from_plan=False)
+        self._no_advance_streak = 0
+        self._no_advance_key = None
+        return False
 
     def _execute(self, act: dict[str, Any]) -> str:
         assert self._client is not None
