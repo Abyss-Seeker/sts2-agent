@@ -21,6 +21,9 @@ server.py + static/     # 本地 Web UI（配置 API/模板、观测决策日志
 
 ## 使用步骤
 
+游戏内录屏展示现支持独立 Mod：见 [native_overlay/README.md](native_overlay/README.md)。
+角色讲解可独立选择简体中文 / English，不必修改游戏语言。
+
 1. **启动游戏**（需已安装 `bridge_mod`，见仓库根目录 README），确认
    `[BridgeServer]` 监听 `127.0.0.1:9002`。
 2. **启动控制台**（在仓库根目录的 `.venv` 中执行，也可用任何 Python ≥3.11）：

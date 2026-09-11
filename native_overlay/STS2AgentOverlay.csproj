@@ -1,0 +1,12 @@
+<Project Sdk="Godot.NET.Sdk/4.5.1">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Sts2DataDir Condition="'$(Sts2DataDir)' == ''">E:/Program Files (x86)/Steam/steamapps/common/Slay the Spire 2/data_sts2_windows_x86_64</Sts2DataDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="dist/**/*.cs" />
+    <Reference Include="sts2"><HintPath>$(Sts2DataDir)/sts2.dll</HintPath><Private Condition="'$(OverlayPreview)' != 'true'">false</Private><Private Condition="'$(OverlayPreview)' == 'true'">true</Private></Reference>
+  </ItemGroup>
+</Project>

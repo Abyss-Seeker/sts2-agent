@@ -89,6 +89,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # decision_validation_attempts: how many LLM decisions (parse/validate
     # attempts) may be made for ONE state. All attempts share one deadline.
     "decision_attempts": 3,
+    "presentation_language": "zh",
     "system_template": DEFAULT_SYSTEM_TEMPLATE,
     "user_template": DEFAULT_USER_TEMPLATE,
     "max_history_turns": 3,
@@ -499,19 +500,22 @@ def validate_action(
                 return None, f"enemy [{ti}] is dead; pick a living enemy"
         return {"action": BridgeAction.PLAY, "card_index": ci, "target_index": ti}, ""
 
-    if name == "potion":
-        potions = state.get("potions") or []
+    if name in ("potion", "discard_potion"):
+        potions = state.get("potions", (state.get("player") or {}).get("potions")) or []
         slot = _as_int(act.get("slot"))
         if slot is None:
             return None, f"'slot' must be an integer, got: {act.get('slot')!r}"
         if slot < 0 or slot >= len(potions):
             return None, f"potion slot {slot} out of range ({len(potions)} slots)"
         potion = potions[slot] or {}
-        if potion.get("can_use") is False:
+        flag = "can_discard" if name == "discard_potion" else "can_use"
+        if potion.get("empty") or potion.get("queued") or not potion.get(flag, False):
             return None, f"potion in slot {slot} cannot be used now"
         ti = _as_int(act.get("target_index", -1))
         if ti is None:
             return None, f"'target_index' must be an integer, got: {act.get('target_index')!r}"
+        if name == "discard_potion":
+            return {"action": BridgeAction.DISCARD_POTION, "slot": slot}, ""
         if potion.get("requires_target"):
             enemies = state.get("enemies") or []
             if ti < 0 or ti >= len(enemies) or not (enemies[ti] or {}).get("is_alive", False):
@@ -1239,6 +1243,10 @@ class AgentSession:
             {"RULEBOOK": RULEBOOK, "CONTRACT": ACTION_CHUNK_CONTRACT,
              "OBJECTIVE": RUN_OBJECTIVE},
         )
+        from presentation import language_instruction
+        language_hint = language_instruction(cfg.get("presentation_language", "zh"))
+        single_system_prompt += language_hint
+        chunk_system_prompt += language_hint
         # Hard wall-clock budget for ONE DECISION, shared by all retry
         # attempts of the same state (see _handle_state).
         #
@@ -3189,6 +3197,9 @@ class AgentSession:
             if name == BridgeAction.END_TURN:
                 self._client.end_turn()
                 return "SENT end_turn"
+            if name == BridgeAction.DISCARD_POTION:
+                self._client.send_action(act)
+                return f"SENT discard potion slot {act['slot']}"
             if name == BridgeAction.POTION:
                 self._client.use_potion(act["slot"], act.get("target_index", -1))
                 return f"SENT potion slot {act['slot']}"

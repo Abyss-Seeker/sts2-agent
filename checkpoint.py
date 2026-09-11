@@ -127,7 +127,7 @@ def _next_ref_resolvable(
             except (KeyError, ResolveError) as exc:
                 return CheckpointDecision(True, CheckpointReason.TARGET_GONE, str(exc))
 
-    elif next_action.kind is ActionKind.POTION:
+    elif next_action.kind in (ActionKind.POTION, ActionKind.DISCARD_POTION):
         if next_action.potion_slot is None:
             return CheckpointDecision(
                 True, CheckpointReason.POTION_INVALID, "planned potion has no slot"
@@ -141,7 +141,7 @@ def _next_ref_resolvable(
             if slot == next_action.potion_slot:
                 found = p
                 break
-        if found is None or found.get("empty") or found.get("can_use") is False:
+        if found is None or found.get("empty") or not found.get("can_discard" if next_action.kind is ActionKind.DISCARD_POTION else "can_use", False):
             return CheckpointDecision(
                 True,
                 CheckpointReason.POTION_INVALID,

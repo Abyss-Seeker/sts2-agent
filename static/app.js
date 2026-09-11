@@ -14,6 +14,7 @@ const NUM_FIELDS = [
 ];
 const TEXTAREA_FIELDS = ["system_template", "user_template"];
 const SELECT_FIELDS = [
+  "presentation_language",
   "show_thinking", "decision_mode", "failure_policy",
   "stream_mode", "provider_profile", "thinking_enabled", "reasoning_policy",
   "reasoning_effort_fixed", "reasoning_effort_combat_entry",

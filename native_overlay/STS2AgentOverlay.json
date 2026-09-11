@@ -1,0 +1,11 @@
+{
+  "id": "STS2AgentOverlay",
+  "name": "Agent thought bubbles",
+  "author": "sts2-agent",
+  "description": "Read-only recording HUD: bilingual thoughts, actions and subtle diagnostics.",
+  "version": "0.3.1",
+  "has_pck": true,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": false
+}

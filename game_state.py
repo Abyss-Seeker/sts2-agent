@@ -165,7 +165,10 @@ def _fmt_potion_slots(
     explicitly. For backwards compatibility, empty slots are also derived
     from the reported capacity when slot entries are missing.
     """
-    lines = ["POTION BELT (empty slots shown as EMPTY; potions do NOT cost energy):"]
+    lines = ["POTION BELT (empty slots shown as EMPTY; potions do NOT cost energy):",
+             'On ANY screen, when Usable now=yes: {"action":"potion","slot":N,"target_index":-1}.',
+             'When Discardable now=yes: {"action":"discard_potion","slot":N}. Discard destroys it without its effect.',
+             'These inventory actions preserve the current room choice; inspect the refreshed state afterward.']
     if not potions and not capacity:
         lines.append("  (belt empty or not reported)")
         return lines
@@ -185,13 +188,14 @@ def _fmt_potion_slots(
         pid = str(p.get("id", "?"))
         name = str(p.get("name", "") or "")
         head = f"{name} ({pid})" if name else pid
-        usable = "yes" if p.get("can_use", True) else "NO"
+        usable = "yes" if p.get("can_use", False) else "NO"
         reason = ""
-        if not p.get("can_use", True) and str(p.get("usage", "")).lower() == "automatic":
+        if not p.get("can_use", False) and str(p.get("usage", "")).lower() == "automatic":
             reason = " (auto/trigger potion, not manually usable)"
         target = str(p.get("target", p.get("target_type", "Self")))
         lines.append(f"  POTION[{i}] {head}")
         lines.append(f"    Usable now: {usable}{reason} | Target: {target}")
+        lines.append("    Discardable now: " + ("yes" if p.get("can_discard", False) else "NO"))
         effect = str(p.get("effect", "") or "")
         if effect:
             lines.append(f"    Effect: {effect}")
@@ -658,7 +662,7 @@ def format_combat_state(
     ]
     usable_potions = [
         int(p.get("slot", i)) for i, p in enumerate(state.get("potions", []) or [])
-        if isinstance(p, dict) and p.get("can_use", True)
+        if isinstance(p, dict) and p.get("can_use", False)
     ]
     lines.append("")
     lines.append("LEGAL ACTIONS RIGHT NOW:")
@@ -669,6 +673,7 @@ def format_combat_state(
         lines.append("Allowed response shapes for THIS screen (choose EXACTLY ONE):")
         lines.append('  {"thought":"...","action":"play","card_index":N,"target_index":N}')
         lines.append('  {"thought":"...","action":"potion","slot":N,"target_index":N}')
+        lines.append('  {"thought":"...","action":"discard_potion","slot":N} (only if discardable)')
         lines.append('  {"thought":"...","action":"end_turn"}')
         lines.append("Choose exactly one action. 'choose' is NOT a valid combat action.")
     else:
@@ -689,6 +694,7 @@ def format_combat_state(
         lines.append('Respond with ONE JSON object: {"thought":"...","actions":[...]}')
         lines.append('  {"kind":"play","card_ref":"hN","target_ref":"eN"}  (omit target_ref when the card needs none)')
         lines.append('  {"kind":"potion","potion_slot":N,"target_ref":"eN"}')
+        lines.append('  {"kind":"discard_potion","potion_slot":N} (only if discardable)')
         lines.append('  {"kind":"end_turn"}  (must be the final action)')
         lines.append('Optional "checkpoint_after":true on an action = inspect its result before'
                      ' deciding more (must then be the last action).')
@@ -724,6 +730,9 @@ def _format_option(i: int, opt: Any, stype: str = "") -> str:
     for key in ("description", "price", "cost", "row", "col", "source_pile"):
         if opt.get(key) not in (None, ""):
             bits.append(f"{key}={opt[key]}")
+    for tip in opt.get("hover_info") or []:
+        if isinstance(tip, dict):
+            bits.append(f"Hover [{tip.get('kind', 'tooltip')}] {tip.get('title', '')}: {tip.get('description', '')}")
     if opt.get("upgraded"):
         bits.append("upgraded")
     if "x" in opt and "y" in opt:
@@ -1020,6 +1029,11 @@ def _legal_shapes_block(state: dict[str, Any]) -> str:
     else:
         out.append('  {"thought":"...","action":"choose","index":i}')
         out.append("  skip is NOT allowed on this screen (it would trigger a random pick).")
+    belt = state.get("potions", (state.get("player") or {}).get("potions")) or []
+    for action, flag in (("potion", "can_use"), ("discard_potion", "can_discard")):
+        slots = [p.get("slot", i) for i, p in enumerate(belt) if isinstance(p, dict) and p.get(flag) and not p.get("empty")]
+        if slots:
+            out.append(f'  {{"thought":"...","action":"{action}","slot":N}} -- legal slots: {slots}')
     return "\n".join(out)
 
 

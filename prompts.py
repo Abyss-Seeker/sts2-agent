@@ -277,7 +277,14 @@ General field rules:
 - "skip" is ONLY valid when the current screen explicitly allows it
   (shown in the legal shapes block). Never send skip anywhere else: the
   game would fall back to a RANDOM choice.
-- In combat the ONLY valid actions are play / potion / end_turn.
+- In combat the valid actions are play / potion / discard_potion / end_turn.
+- On ANY decision screen, potion and discard_potion are also legal when
+  their corresponding Usable now / Discardable now flag is yes.
+  Use {"action":"potion","slot":N,"target_index":-1} for non-targeted use,
+  or {"action":"discard_potion","slot":N} to destroy a potion without its effect.
+  Consider usable potions before committing a room choice or ending a turn.
+  AnyTime potions may work outside combat. Follow current flags and visible
+  descriptions. Throwing a potion for its effect means USE, not discard.
   "action":"choose" is NOT valid in combat.
 """
 
@@ -319,6 +326,7 @@ Action shapes (use the PLAN-SCOPED REFERENCES from the current state):
   {"kind":"play","card_ref":"h0","target_ref":"e0"}   play card h0 at enemy e0
   {"kind":"play","card_ref":"h2"}                     play a card that needs no target
   {"kind":"potion","potion_slot":0,"target_ref":"e0"} use potion slot 0
+  {"kind":"discard_potion","potion_slot":0}           discard slot 0 if allowed
   {"kind":"end_turn"}                                 end the turn (must be the LAST action)
 
 Rules:

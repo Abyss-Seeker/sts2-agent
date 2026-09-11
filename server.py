@@ -15,12 +15,14 @@ import json
 import logging
 import threading
 import webbrowser
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from agent import DEFAULT_CONFIG, AgentSession, migrate_prompt_config
+from presentation import overlay_feed
 
 PROMPT_MIGRATION_WARNINGS: list[str] = []
 
@@ -49,6 +51,7 @@ def load_config() -> dict:
     return cfg
 
 session = AgentSession()
+OVERLAY_STREAM_ID = uuid.uuid4().hex
 
 
 def save_config(cfg: dict) -> None:
@@ -85,6 +88,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        if path == "/api/overlay":
+            qs = parse_qs(parsed.query)
+            try:
+                after = max(0, int(qs.get("after", ["0"])[0]))
+            except ValueError:
+                after = 0
+            self._send_json(overlay_feed(session.logs_since(0), load_config(), after,
+                                         OVERLAY_STREAM_ID))
+            return
         if path == "/api/status":
             self._send_json(session.status())
             return
@@ -109,6 +121,16 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
 
+        if parsed.path == "/api/overlay/language":
+            language = body.get("language") if isinstance(body, dict) else None
+            if language not in ("zh", "en"):
+                self.send_error(HTTPStatus.BAD_REQUEST, "language must be zh or en")
+                return
+            cfg = load_config()
+            cfg["presentation_language"] = language
+            save_config(cfg)
+            self._send_json({"language": language, "restart_agent_required": True})
+            return
         if parsed.path == "/api/config":
             cfg = load_config()
             cfg.update(body)

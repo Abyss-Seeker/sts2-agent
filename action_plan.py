@@ -29,6 +29,7 @@ class ResolveError(RuntimeError):
 class ActionKind(str, Enum):
     PLAY = "play"
     POTION = "potion"
+    DISCARD_POTION = "discard_potion"
     END_TURN = "end_turn"
 
 
@@ -285,7 +286,7 @@ def parse_action_chunk(
                 )
             )
 
-        elif kind is ActionKind.POTION:
+        elif kind in (ActionKind.POTION, ActionKind.DISCARD_POTION):
             slot = _as_int(raw.get("potion_slot", raw.get("slot")), "potion_slot")
             raw_target = raw.get("target_ref")
             target_ref = (

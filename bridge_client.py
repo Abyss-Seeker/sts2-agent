@@ -81,6 +81,7 @@ class BridgeAction:
     CHOOSE = "choose"
     SKIP = "skip"
     POTION = "potion"
+    DISCARD_POTION = "discard_potion"
     PING = "ping"
     SET_FALLBACK = "set_fallback"
 

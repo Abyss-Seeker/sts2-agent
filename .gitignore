@@ -14,3 +14,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+native_overlay/.godot/
+native_overlay/bin/
+native_overlay/obj/
+native_overlay/dist/
+
+bridge_update/.godot/
+bridge_update/bin/
+bridge_update/obj/
+bridge_update/current_*.txt

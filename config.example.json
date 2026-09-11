@@ -1,4 +1,5 @@
 {
+  "presentation_language": "zh",
   "bridge_host": "127.0.0.1",
   "bridge_port": 9002,
   "api_base_url": "https://api.openai.com",

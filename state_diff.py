@@ -88,7 +88,7 @@ def _enemy_subset(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _potion_subset(state: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for p in state.get("potions") or []:
+    for p in state.get("potions", (state.get("player") or {}).get("potions")) or []:
         if not isinstance(p, dict):
             continue
         out.append({
@@ -96,6 +96,8 @@ def _potion_subset(state: dict[str, Any]) -> list[dict[str, Any]]:
             "id": p.get("id"),
             "empty": p.get("empty"),
             "can_use": p.get("can_use"),
+            "can_discard": p.get("can_discard"),
+            "queued": p.get("queued"),
             "requires_target": p.get("requires_target"),
         })
     return out

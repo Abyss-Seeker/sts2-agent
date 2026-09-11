@@ -1,0 +1,8 @@
+config_version=5
+
+[application]
+config/name="STS2AgentOverlay"
+config/features=PackedStringArray("4.5", "C#")
+
+[dotnet]
+project/assembly_name="STS2AgentOverlay"

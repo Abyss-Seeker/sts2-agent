@@ -133,7 +133,7 @@ class ActionChunkExecutor:
                 + (f" -> {planned.target_ref}/ENEMY[{ti}]" if ti >= 0 else ""),
             )
 
-        if planned.kind is ActionKind.POTION:
+        if planned.kind in (ActionKind.POTION, ActionKind.DISCARD_POTION):
             if planned.potion_slot is None:
                 raise ResolveError("planned potion missing potion_slot")
             ti = -1
@@ -144,11 +144,11 @@ class ActionChunkExecutor:
                 ti = resolve_enemy_ref(enemy_ref, state)
             return (
                 {
-                    "action": "potion",
+                    "action": planned.kind.value,
                     "slot": planned.potion_slot,
                     "target_index": ti,
                 },
-                f"use potion slot {planned.potion_slot}"
+                f"{planned.kind.value} slot {planned.potion_slot}"
                 + (f" -> {planned.target_ref}/ENEMY[{ti}]" if ti >= 0 else ""),
             )
 
