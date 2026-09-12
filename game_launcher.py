@@ -22,14 +22,29 @@ _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 def _registry_steam_path() -> str | None:
     if sys.platform != "win32":
         return None
-    try:
-        import winreg
+    import winreg
+    from pathlib import Path
 
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
-            value, _ = winreg.QueryValueEx(key, "SteamPath")
-            return str(value)
-    except OSError:
-        return None
+    # Service/sandbox accounts may not have the interactive user's HKCU.
+    # Probe both machine registry views, and ignore stale installation paths.
+    locations = [
+        (winreg.HKEY_CURRENT_USER, 0, "SteamExe"),
+        (winreg.HKEY_CURRENT_USER, 0, "SteamPath"),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY, "InstallPath"),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY, "InstallPath"),
+    ]
+    for hive, view, name in locations:
+        try:
+            with winreg.OpenKey(hive, r"Software\Valve\Steam", 0,
+                                winreg.KEY_READ | view) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+            path = Path(os.path.expandvars(str(value).strip().strip('"')))
+            directory = path.parent if name == "SteamExe" else path
+            if (directory / "steam.exe").is_file():
+                return str(directory)
+        except OSError:
+            continue
+    return None
 
 
 def find_steam_exe() -> str | None:
@@ -47,7 +62,7 @@ def find_steam_exe() -> str | None:
     ]
     for path in candidates:
         exe = Path(path) / "steam.exe"
-        if exe.exists():
+        if exe.is_file():
             return str(exe)
     return None
 
@@ -138,8 +153,8 @@ def ensure_game_running(
         log("GAME_PROCESS_RUNNING（无需启动）")
         return True
 
-    steam_alive = find_steam_exe() is not None
-    log(f"GAME_PROCESS_NOT_FOUND; STEAM_PROCESS_FOUND={steam_alive}")
+    steam_exe_found = find_steam_exe() is not None
+    log(f"GAME_PROCESS_NOT_FOUND; STEAM_EXE_FOUND={steam_exe_found}")
 
     for attempt in range(1, launch_attempts + 1):
         # Re-observe before every attempt; never spam the same command.

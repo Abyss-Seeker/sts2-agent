@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from prompts import DEFAULT_USER_TEMPLATE
 
 # Hard per-request transport guard: an extremely large single state could
 # exceed the model context window on its own. When triggered, the state is
@@ -76,20 +77,8 @@ def _structured_compress(text: str, limit: int) -> str:
         # Last resort: drop pile composition lines (composition is still
         # described in RunMemory/history), then blank-line squeeze.
         lines = [l for l in lines if not l.strip().startswith("Composition:")]
-    if size() > limit:
-        # Absolute last resort: drop the longest lines one by one, keeping
-        # the remaining order intact (still whole lines, never a substring).
-        indexed = sorted(enumerate(lines), key=lambda t: -len(t[1]))
-        dropped = set()
-        total = sum(len(l) for l in lines)
-        for idx, line in indexed:
-            if total <= limit:
-                break
-            if len(line) < 80:
-                break  # don't nuke short structural lines
-            dropped.add(idx)
-            total -= len(line)
-        lines = [l for i, l in enumerate(lines) if i not in dropped]
+    # Never remove arbitrary long lines: these can be card effects or legal
+    # options. The remaining essential state takes priority over this guard.
     return "".join(lines)
 
 
@@ -125,19 +114,32 @@ class ContextManager:
         system_prompt: str,
         run_memory_text: str,
         state_text: str,
+        *,
+        user_template: str = DEFAULT_USER_TEMPLATE,
     ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
         # The current state always goes out whole. Only the pathological
         # transport cap applies, and it compresses structurally.
         current_state = _structured_compress(state_text, CURRENT_STATE_HARD_CAP)
+        template = user_template if isinstance(user_template, str) else DEFAULT_USER_TEMPLATE
+        # Memory retains its own layer. Expand its placeholder only for custom
+        # templates; the historic default would otherwise duplicate it.
+        if template.strip() == DEFAULT_USER_TEMPLATE.strip():
+            user_text = current_state
+        else:
+            values = {"STATE": current_state, "RUN_MEMORY": run_memory_text}
+            user_text = re.sub(r"\{\{(STATE|RUN_MEMORY)\}\}",
+                               lambda match: values[match.group(1)], template)
+            if "{{STATE}}" not in template:
+                user_text += "\n\n" + current_state
 
         # Budget: history is trimmed first; RUN MEMORY and the current
         # state are never cut to fit the soft budget.
         budget = self.config.max_context_chars
         budget -= len(system_prompt)
         budget -= len(run_memory_text) + 200
-        budget -= len(current_state)
+        budget -= len(user_text)
 
         # Trim OLDEST history first when over budget.
         selected: list[DecisionTurn] = []
@@ -154,7 +156,9 @@ class ContextManager:
                 "role": "system",
                 "content": (
                     "RECENT DECISIONS (oldest first, context only). Each shows the"
-                    " situation you faced, the JSON you answered, and what happened:"
+                    " situation you faced, the JSON you proposed, and what happened."
+                    " A proposal is not proof of execution or a recommended example;"
+                    " only confirmed results establish what actually happened:"
                 ),
             })
             for i, turn in enumerate(selected):
@@ -167,7 +171,7 @@ class ContextManager:
         messages.append({"role": "system", "content": run_memory_text})
         messages.append({
             "role": "user",
-            "content": current_state
+            "content": user_text
             + "\n\nAnswer now with EXACTLY ONE valid JSON object and nothing else.",
         })
         return messages

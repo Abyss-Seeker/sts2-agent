@@ -11,6 +11,7 @@ const NUM_FIELDS = [
   "agent_timeout",
   "max_history_turns", "max_state_chars", "max_context_chars", "action_delay",
   "action_chunk_max_actions",
+  "reasoning_max_chars",
 ];
 const TEXTAREA_FIELDS = ["system_template", "user_template"];
 const SELECT_FIELDS = [
@@ -21,7 +22,7 @@ const SELECT_FIELDS = [
   "reasoning_effort_combat_followup", "reasoning_effort_noncombat",
   "reasoning_effort_retry",
 ];
-const CHECK_FIELDS = ["disable_fallback", "save_log", "auto_launch_game", "delta_observations", "headful_native_ui", "fast_mode"];
+const CHECK_FIELDS = ["disable_fallback", "save_log", "auto_launch_game", "delta_observations", "headful_native_ui", "fast_mode", "enemy_behavior_knowledge", "show_sent_messages"];
 
 const DEFAULT_PROMPTS = null; // filled from server DEFAULT_CONFIG on load
 let defaults = null;
@@ -81,6 +82,7 @@ function escapeHtml(s) {
 // ---------------- status polling ----------------
 
 const KIND_LABEL = {
+  sent_messages: "发送消息",
   decision: "决策",
   info: "信息",
   error: "错误",
@@ -138,7 +140,11 @@ function renderLogs(logs) {
       (e.state_type ? ` · ${e.state_type}` : "") +
       (e.llm_ms ? ` · LLM ${(e.llm_ms / 1000).toFixed(1)}s` : "");
     let html = `<div class="meta"><span class="tag">${KIND_LABEL[e.kind] || e.kind}</span>${escapeHtml(meta)}</div>`;
-    html += `<div>${escapeHtml(e.text || "")}</div>`;
+    if (e.kind === "sent_messages") {
+      html += `<details><summary>完整请求 messages</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:600px;overflow:auto">${escapeHtml(e.text || "")}</pre></details>`;
+    } else {
+      html += `<div>${escapeHtml(e.text || "")}</div>`;
+    }
     const renderedAction = e.action || e.actions;
     if (renderedAction) html += `<div class="action">➤ ${escapeHtml(renderedAction)} ${e.result ? "— " + escapeHtml(e.result) : ""}</div>`;
     div.innerHTML = html;
@@ -203,6 +209,18 @@ $("btn-save").addEventListener("click", async () => {
   }
 });
 $("btn-start").addEventListener("click", startAgent);
+$("show_sent_messages").addEventListener("change", async () => {
+  const input = $("show_sent_messages");
+  input.disabled = true;
+  try {
+    await api("/api/config", "POST", { show_sent_messages: input.checked });
+  } catch (err) {
+    input.checked = !input.checked;
+    appendLocal("error", "更新消息显示失败: " + err.message);
+  } finally {
+    input.disabled = false;
+  }
+});
 $("btn-stop").addEventListener("click", stopAgent);
 $("btn-reset-prompts").addEventListener("click", () => {
   if (!defaults) return;

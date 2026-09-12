@@ -135,6 +135,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = load_config()
             cfg.update(body)
             save_config(cfg)
+            session.set_show_sent_messages(bool(cfg.get("show_sent_messages", False)))
             self._send_json({"ok": True, "config": cfg})
             return
         if parsed.path == "/api/agent/start":

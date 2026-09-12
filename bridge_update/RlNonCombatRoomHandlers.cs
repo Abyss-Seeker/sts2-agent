@@ -10,6 +10,7 @@ using Godot;
 using MegaCrit.Sts2.Core.AutoSlay;
 using MegaCrit.Sts2.Core.AutoSlay.Handlers;
 using MegaCrit.Sts2.Core.AutoSlay.Helpers;
+using MegaCrit.Sts2.Core.Context;
 using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
@@ -564,6 +565,23 @@ public class RlShopRoomHandler : IRoomHandler, IHandler
             ["enabled"] = slot.Entry.IsStocked && slot.Entry.EnoughGold,
             ["price"] = slot.Entry.Cost,
         };
+        switch (slot.Entry)
+        {
+            case MerchantPotionEntry potionEntry when potionEntry.Model is { } potion:
+                option["effect"] = CardSerialization.CleanText(potion.DynamicDescription.GetFormattedText());
+                option["hover_info"] = CardSerialization.SerializeVisibleHoverTips(potion.HoverTips);
+                option["usage"] = potion.Usage.ToString();
+                bool hasSlot = LocalContext.GetMe(RunManager.Instance.DebugOnlyGetState())?.HasOpenPotionSlots ?? false;
+                option["requires_empty_potion_slot"] = !hasSlot;
+                option["enabled"] = slot.Entry.IsStocked && slot.Entry.EnoughGold && hasSlot;
+                break;
+            case MerchantRelicEntry relicEntry when relicEntry.Model is { } relic:
+                option["description"] = CardSerialization.CleanText(relic.DynamicDescription.GetFormattedText());
+                break;
+            case MerchantCardEntry cardEntry when cardEntry.CreationResult?.Card is { } card:
+                option["card"] = CardSerialization.SerializeCardFull(card, includeUpgradePreview: true);
+                break;
+        }
         return option;
     }
 

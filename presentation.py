@@ -43,6 +43,7 @@ def overlay_feed(logs: list[dict], config: dict, after: int, stream_id: str) -> 
     Limit batches, not individual entries; a large diagnostic remains readable.
     The process token allows the HUD to discard stale history after server restart.
     """
+    logs = [entry for entry in logs if not entry.get("console_only")]
     result = overlay_snapshot(logs, config)
     pending = [entry for entry in logs if entry["seq"] > after]
     batch: list[dict] = []

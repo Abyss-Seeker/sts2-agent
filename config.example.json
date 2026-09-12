@@ -1,5 +1,6 @@
 {
   "presentation_language": "zh",
+  "enemy_behavior_knowledge": true,
   "bridge_host": "127.0.0.1",
   "bridge_port": 9002,
   "api_base_url": "https://api.openai.com",
@@ -10,7 +11,6 @@
   "llm_timeout": 90,
   "llm_retries": 0,
   "decision_attempts": 3,
-  "system_template": "{{RULEBOOK}}\n\n{{CONTRACT}}",
   "user_template": "{{RUN_MEMORY}}\n\n{{STATE}}\n",
   "max_history_turns": 3,
   "max_state_chars": 4000,
@@ -32,6 +32,7 @@
   "action_chunk_max_actions": 8,
   "delta_observations": false,
   "thinking_enabled": true,
+  "reasoning_max_chars": 6000,
   "reasoning_policy": "adaptive",
   "reasoning_effort_fixed": "high",
   "reasoning_effort_combat_entry": "high",

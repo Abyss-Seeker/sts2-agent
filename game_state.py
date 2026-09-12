@@ -166,9 +166,8 @@ def _fmt_potion_slots(
     from the reported capacity when slot entries are missing.
     """
     lines = ["POTION BELT (empty slots shown as EMPTY; potions do NOT cost energy):",
-             'On ANY screen, when Usable now=yes: {"action":"potion","slot":N,"target_index":-1}.',
-             'When Discardable now=yes: {"action":"discard_potion","slot":N}. Discard destroys it without its effect.',
-             'These inventory actions preserve the current room choice; inspect the refreshed state afterward.']
+             "Use and discard are different actions: discard destroys the potion without its effect.",
+             "Current flags determine legality; use the response schema for this screen."]
     if not potions and not capacity:
         lines.append("  (belt empty or not reported)")
         return lines
@@ -194,11 +193,20 @@ def _fmt_potion_slots(
             reason = " (auto/trigger potion, not manually usable)"
         target = str(p.get("target", p.get("target_type", "Self")))
         lines.append(f"  POTION[{i}] {head}")
+        if p.get("usage"):
+            lines.append(f"    Usage class: {p['usage']} (subject to Usable now)")
         lines.append(f"    Usable now: {usable}{reason} | Target: {target}")
         lines.append("    Discardable now: " + ("yes" if p.get("can_discard", False) else "NO"))
         effect = str(p.get("effect", "") or "")
         if effect:
             lines.append(f"    Effect: {effect}")
+        for tip in p.get("hover_info") or []:
+            if isinstance(tip, dict):
+                lines.append(f"    Hover: {tip.get('title', '')}: {tip.get('description', '')}")
+        if pid.upper() == "FOUL_POTION":
+            lines.append("    Mechanic (static reference): in combat EVERYONE includes you; "
+                         "outside combat its Merchant interaction uses potion, not discard_potion. "
+                         "TargetedNoCreature needs no enemy index; follow the current effect text.")
     if capacity is not None and max_known < capacity:
         pass  # empty slots already rendered from capacity
     return lines
@@ -447,11 +455,18 @@ def _format_enemy(enemy: dict[str, Any], index: int) -> list[str]:
     intent = str(enemy.get("intent", "UNKNOWN")).upper()
     desc = INTENT_GLOSSARY.get(intent, "intent unknown")
     intent_str = f"Intent: {intent} = {desc}"
-    if intent in ("ATTACK", "MULTI_ATTACK") and "intent_damage" in enemy:
+    if "intent_damage" in enemy:
         # Exact value the game displays on the intent icon.
         hits = enemy.get("intent_hits", 1) or 1
         intent_str += f" -- displayed attack: {enemy['intent_damage']} damage x {hits} hit(s) on you"
     lines.append(f"      {intent_str}")
+    if isinstance(enemy.get("intents"), list):
+        extra = [str(value).upper() for value in enemy["intents"]
+                 if str(value).upper() != intent]
+        if extra:
+            lines.append("      Additional visible intents: " + "; ".join(
+                f"{value} = {INTENT_GLOSSARY.get(value, 'see current effect text')}"
+                for value in extra))
     ptext = _fmt_powers(enemy.get("powers"), indent="      ")
     if ptext:
         lines.append("      Powers:")
@@ -529,7 +544,11 @@ def _target_and_hover_lines(card: dict[str, Any], indent: str = "    ") -> list[
                 nm = tp.get("enemy_name") or tp.get("enemy_id", "?")
                 for ln in str(tp.get("displayed_text", "")).splitlines():
                     if ln.strip():
-                        lines.append(f"{indent}  vs ENEMY[{j}] {nm}: {ln.strip()}")
+                        target_index = tp.get("enemy_index")
+                        target_label = (f"ENEMY[{target_index}] {nm}"
+                                        if isinstance(target_index, int) and target_index >= 0
+                                        else f"{nm} (index not reported)")
+                        lines.append(f"{indent}  vs {target_label}: {ln.strip()}")
     elif card.get("target_preview_identical"):
         lines.append(f"{indent}Target-specific preview: identical for all legal targets.")
     hover = card.get("hover_info")
@@ -572,7 +591,7 @@ def _format_hand(hand: list[dict[str, Any]], energy: int,
         runtime_lines = _runtime_card_lines(card)
         lines.extend(runtime_lines)
         # Static reference only fills the gap when no rendered text exists.
-        if not runtime_lines:
+        if not (card.get("current_display_text") or card.get("display_text")):
             static_line = _static_card_line(card)
             if static_line:
                 lines.append(f"    {static_line}")
@@ -686,18 +705,11 @@ def format_combat_state(
             lines.append(compact_ref_legend(state))
         except ImportError:
             pass
-        lines.append("ACTION-CHUNK RULE: You may commit several actions that are already")
-        lines.append("determined by the information visible now. The harness validates every")
-        lines.append("action against the updated game state. If a later action becomes")
-        lines.append("invalid or new decision-relevant information appears, the harness")
-        lines.append("stops the remaining chunk and asks you again.")
         lines.append('Respond with ONE JSON object: {"thought":"...","actions":[...]}')
         lines.append('  {"kind":"play","card_ref":"hN","target_ref":"eN"}  (omit target_ref when the card needs none)')
         lines.append('  {"kind":"potion","potion_slot":N,"target_ref":"eN"}')
         lines.append('  {"kind":"discard_potion","potion_slot":N} (only if discardable)')
         lines.append('  {"kind":"end_turn"}  (must be the final action)')
-        lines.append('Optional "checkpoint_after":true on an action = inspect its result before'
-                     ' deciding more (must then be the last action).')
         lines.append("Only reference cards/enemies listed above. 'choose' is NOT a valid combat action.")
     return "\n".join(lines)
 
@@ -727,7 +739,7 @@ def _format_option(i: int, opt: Any, stype: str = "") -> str:
         or ""
     )
     bits.append(str(label))
-    for key in ("description", "price", "cost", "row", "col", "source_pile"):
+    for key in ("description", "effect", "usage", "target", "price", "cost", "row", "col", "source_pile", "requires_empty_potion_slot"):
         if opt.get(key) not in (None, ""):
             bits.append(f"{key}={opt[key]}")
     for tip in opt.get("hover_info") or []:
@@ -738,6 +750,11 @@ def _format_option(i: int, opt: Any, stype: str = "") -> str:
     if "x" in opt and "y" in opt:
         bits.append(f"position=({opt['x']},{opt['y']})")
     text = f"  OPTION[{i}] " + " | ".join(bits)
+    if isinstance(opt.get("card"), dict):
+        text += "\n" + "\n".join(_runtime_card_lines(opt["card"], indent="      "))
+        preview = opt["card"].get("upgrade_preview_text")
+        if preview:
+            text += f"\n      Upgrade preview (as shown by the game): {preview}"
     # Attach static full text for card/relic-style ids.
     cid = str(opt.get("id", opt.get("card_id", "")) or "")
     if cid:
@@ -767,7 +784,12 @@ def _format_full_map(full_map: list[dict[str, Any]], visited: list[dict[str, Any
     UI, with ALL visible edges. '?' nodes stay UNKNOWN."""
     visited_set = {(v.get("row"), v.get("col")) for v in visited if isinstance(v, dict)}
     by_row: dict[int, list[dict[str, Any]]] = {}
+    seen = set()
     for node in full_map:
+        coord = (node.get("row"), node.get("col"))
+        if coord in seen:
+            continue
+        seen.add(coord)
         by_row.setdefault(int(node.get("row", 0)), []).append(node)
     lines = [
         "FULL ACT MAP (row: room type -> connected next nodes; '*' = on your visited path):"
@@ -810,7 +832,7 @@ def _format_card_candidates(cards: list[Any]) -> list[str]:
             lines.append(f"    Type: {card['type']}")
         runtime_lines = _runtime_card_lines(card)
         lines.extend(runtime_lines)
-        if not runtime_lines:
+        if not (card.get("current_display_text") or card.get("display_text")):
             static_line = _static_card_line(card)
             if static_line:
                 lines.append(f"    {static_line}")
@@ -867,6 +889,12 @@ def _format_selection_combat_context(combat: dict[str, Any]) -> list[str]:
             lines.append(
                 f"    HAND[{i}] {head} | {_cost_lines(card)} | Playable: {playable}"
             )
+            lines.extend(_runtime_card_lines(card, indent="      "))
+            lines.extend(_target_and_hover_lines(card, indent="      "))
+            if not (card.get("current_display_text") or card.get("display_text")):
+                reference = _static_card_line(card)
+                if reference:
+                    lines.append(f"      {reference}")
     else:
         lines.append("    (empty)")
     return lines
@@ -877,7 +905,8 @@ def format_choice_state(state: dict[str, Any], run_memory: Any = None) -> str:
     lines: list[str] = []
     title = CHOICE_TYPE_TITLES.get(stype, stype.upper() + ": pick an option by index")
     player = state.get("player") or {}
-    lines.extend(_run_header(state, title.split(":")[0].strip(), player))
+    lines.extend(_run_header(state, title.split(":")[0].strip(), player,
+                             potions=state.get("potions")))
     lines.append(f"== {title} ==")
 
     # Screen-specific narrative / prompt context
@@ -907,6 +936,10 @@ def format_choice_state(state: dict[str, Any], run_memory: Any = None) -> str:
             lines.append("")
             lines.extend(_format_selection_combat_context(combat))
     if stype == BridgeStateType.SHOP:
+        if state.get("screen") == "merchant_entrance":
+            lines.append("Merchant visible; inventory closed. Using an available "
+                         "Foul Potion here is its Merchant interaction. Opening "
+                         "inventory is a separate choice; use the current potion flags.")
         lines.append(
             "Prices are the current shop prices as shown; DISABLED = sold out or"
             " unaffordable. To leave, pick the 'Leave shop' option."
@@ -925,6 +958,13 @@ def format_choice_state(state: dict[str, Any], run_memory: Any = None) -> str:
     lines.extend(_format_player_summary(player))
 
     if stype == BridgeStateType.MAP_SELECT:
+        options_now = _option_entries(state)
+        coords = {(o.get("row"), o.get("col")) for o in options_now
+                  if isinstance(o, dict) and o.get("enabled", True)}
+        lines.append(f"CURRENT SELECTABLE ROOM COORDINATES: {len(coords)} distinct node(s).")
+        lines.append("The full map and the options below describe the SAME nodes by (row,col), "
+                     "not additional rooms. Visited nodes are past rooms, not future choices. "
+                     "Do not assume two Ancient rooms or infer choices from a previous act.")
         full_map = state.get("full_map") or []
         if full_map:
             lines.extend(_format_full_map(full_map, state.get("visited") or []))
@@ -1199,13 +1239,15 @@ def format_state(
     if stype == BridgeStateType.COMBAT_ACTION:
         try:
             return format_combat_state(state, run_memory, response_mode=response_mode)
-        except Exception as e:
-            return f"== COMBAT (formatting error: {e}) ==\nraw: {state}"
+        except Exception:
+            logging.getLogger(__name__).exception("Combat observation formatting failed")
+            return "== COMBAT (formatting error: observation unavailable) =="
     if stype in CHOICE_TYPES:
         try:
             text = format_choice_state(state, run_memory)
-        except Exception as e:
-            text = f"== CHOICE (formatting error: {e}) ==\nraw: {state}"
+        except Exception:
+            logging.getLogger(__name__).exception("Choice observation formatting failed")
+            return "== CHOICE (formatting error: observation unavailable) =="
         return text + "\n\n" + _legal_shapes_block(state)
     if stype in (BridgeStateType.GAME_OVER, BridgeStateType.RUN_COMPLETE):
         return format_terminal_state(state)

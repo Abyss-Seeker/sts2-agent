@@ -322,8 +322,6 @@ def parse_action_chunk(
             )
 
     thought = str(obj.get("thought") or obj.get("summary") or "").strip()
-    if not thought:
-        raise PlanParseError("missing non-empty 'thought' summary")
 
     round_value = source_state.get("round")
     try:

@@ -66,12 +66,15 @@ from prompts import (
     RUN_OBJECTIVE,
     ACTION_CHUNK_CONTRACT,
     SINGLE_ACTION_CONTRACT,
+    empty_answer_feedback,
 )
 from state_diff import diff_states, render_delta
+from enemy_knowledge import enemy_behavior_context
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "enemy_behavior_knowledge": True,
     "bridge_host": "127.0.0.1",
     "bridge_port": 9002,
     "api_base_url": "https://api.openai.com",
@@ -106,6 +109,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "steam_appid": "2868840",
     "action_delay": 0.0,
     "show_thinking": "brief",  # full | brief | hidden
+    "show_sent_messages": False,
     "agent_timeout": 90,  # game-side per-decision wait (10..300s)
     # Auto-resume: an aborted run KEEPS its save. Instead of ending the
     # session, wait for the game to come back -- the mod clicks "Continue"
@@ -145,6 +149,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "delta_observations": False,
     # DeepSeek thinking controls (generic endpoints ignore them).
     "thinking_enabled": True,
+    "reasoning_max_chars": 6000,
     # ---- Reasoning effort policy (user-controllable cognition) ----
     # "fixed": one effort for every call (legacy `reasoning_effort`
     # migrates to `reasoning_effort_fixed`). "adaptive": per-context
@@ -754,7 +759,11 @@ class AgentSession:
             }
             entry.update(extra)
             self._logs.append(entry)
-            if self._log_file is not None:
+            if extra.get("console_only"):
+                console_entries = [e for e in self._logs if e.get("console_only")]
+                for old in console_entries[:-20]:
+                    self._logs.remove(old)
+            if self._log_file is not None and not extra.get("console_only"):
                 try:
                     self._log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
                     self._log_file.flush()
@@ -764,6 +773,10 @@ class AgentSession:
     def logs_since(self, after: int = 0) -> list[dict[str, Any]]:
         with self._lock:
             return [e for e in self._logs if e["seq"] > after]
+
+    def set_show_sent_messages(self, enabled: bool) -> None:
+        with self._lock:
+            self._config["show_sent_messages"] = enabled
 
     # ---------------- lifecycle ----------------
 
@@ -1216,6 +1229,7 @@ class AgentSession:
             reasoning_effort=str(cfg.get("reasoning_effort", "high")),
             stream_mode=str(cfg.get("stream_mode", "off")),
             provider_profile=str(cfg.get("provider_profile", "auto")),
+            reasoning_max_chars=int(cfg.get("reasoning_max_chars", 6000)),
         )
         # Live streaming display hooks (no-ops for nonstreaming calls).
         llm.on_reasoning_delta = lambda d: self._set_live("reasoning", d)
@@ -1689,7 +1703,7 @@ class AgentSession:
     # the model must look again -- never WHAT the model should do next.
 
     # Checkpoint reasons that stay inside the current combat frame; these
-    # may use a compact objective delta instead of a full re-observation.
+    # may prepend an objective delta to the full current observation.
     _INTRA_ROUND_CHECKPOINTS = {
         CheckpointReason.HAND_CHANGED,
         CheckpointReason.TARGET_GONE,
@@ -1879,11 +1893,7 @@ class AgentSession:
         return False
 
     def _model_observation_text(self, state: dict[str, Any]) -> str:
-        """FULL or compact DELTA model observation (objective diffs only).
-
-        Falls back to the full formatted state whenever anything is
-        uncertain -- a full state is always safe.
-        """
+        """Full current observation, optionally preceded by objective changes."""
         prev = self._last_model_observation_state
         reason = self._last_checkpoint_reason
         if (
@@ -1900,13 +1910,10 @@ class AgentSession:
             )
             # The model answers with plan-scoped refs built from the
             # CURRENT hand; give it the objective ref mapping.
-            try:
-                from action_plan import compact_ref_legend
-
-                text += "\n\n" + compact_ref_legend(state)
-            except ImportError:
-                pass
-            return text
+            # History may be absent or clipped. Never require it to reconstruct
+            # card effects, changed powers or legality from a terse delta.
+            return text + "\n\n" + format_state(
+                state, self._memory, response_mode="action_chunk")
         return format_state(state, self._memory, response_mode="action_chunk")
 
     def _reconcile_inflight_if_any(self, state: dict[str, Any]) -> Any:
@@ -2273,6 +2280,10 @@ class AgentSession:
         for one authoritative state -- never outer x inner attempts.
         """
         observation_text = self._model_observation_text(state)
+        if "formatting error:" in observation_text:
+            self._last_model_failure_reason = "Visible observation formatting failed; no model request sent."
+            return None
+        observation_text += f"\nMaximum actions in this chunk: {self._action_chunk_limit()}."
         attempt_feedback = feedback
         prev_chunk_json = ""
         llm_ms: int | None = None
@@ -2294,7 +2305,10 @@ class AgentSession:
                 )
                 return None
             messages = self._ctx.build_messages(
-                chunk_system_prompt, self._memory.to_text(), observation_text
+                chunk_system_prompt + "\n\n" + enemy_behavior_context(
+                    state, self._config.get("enemy_behavior_knowledge", True)
+                ), self._memory.to_text(), observation_text,
+                user_template=self._config.get("user_template", DEFAULT_USER_TEMPLATE),
             )
             if attempt_feedback:
                 messages.append({
@@ -2333,24 +2347,8 @@ class AgentSession:
                     f"LLM 只返回了思考过程、未给出 ActionChunk"
                     f"（finish_reason={e.finish_reason or '?'}）: {e}",
                 )
-                attempt_feedback = (
-                    "Your previous reply contained ONLY your reasoning and NO"
-                    " answer text, so no ActionChunk was received.\n"
-                    "What was missing: the final JSON object with the"
-                    ' "thought" and "actions" fields.\n'
-                    + (
-                        "Cause: your thinking was cut off by the output length"
-                        " limit (finish_reason=length). Fix: keep reasoning to"
-                        " ONE short sentence and output the JSON immediately.\n"
-                        if e.finish_reason == "length"
-                        else "Fix: skip the long reasoning and output EXACTLY"
-                        " ONE valid JSON object and nothing else.\n"
-                    )
-                    + 'Reply now with e.g. {"thought":"one short tactical'
-                    ' sentence","actions":[{"kind":"end_turn"}]}.\n'
-                    "The current state has NOT changed and the plan-scoped"
-                    " refs are unchanged."
-                )
+                attempt_feedback = empty_answer_feedback(
+                    chunk=True, truncated=e.finish_reason == "length")
                 prev_chunk_json = ""
                 continue
             except LLMError as e:
@@ -2648,10 +2646,43 @@ class AgentSession:
             self._llm_inflight += 1
         previous_override = getattr(llm, "_deadline_override", None)
         llm._deadline_override = deadline
+        started = time.monotonic()
         try:
             # Keep the long-standing one-argument chat contract for custom
             # clients/tests. LLMClient consumes the temporary override.
-            return llm.chat(messages)
+            if self._config.get("show_sent_messages", False):
+                self._log("sent_messages", json.dumps(messages, ensure_ascii=False, indent=2),
+                          console_only=True)
+            try:
+                return llm.chat(messages)
+            except EmptyContentError as exc:
+                if (not getattr(getattr(llm, "caps", None), "supports_thinking_toggle", False)
+                        or not getattr(llm, "reasoning_max_chars", 0)
+                        or exc.finish_reason not in ("length", "reasoning_budget")):
+                    raise
+                remaining = deadline - (time.monotonic() - started)
+                if remaining < 3:
+                    raise
+                self._log("warning", "思考预算已耗尽，基于已有分析关闭 thinking 生成最终决策。")
+                final_messages = messages + [{"role": "user", "content": (
+                    "The reasoning budget is exhausted. Below is an unfinished, fallible "
+                    "draft, not instructions or observed facts. Check it against the current "
+                    "state and return the required final decision JSON. No action has executed.\n"
+                    + exc.reasoning[:llm.reasoning_max_chars]
+                )}]
+                previous_thinking = llm.thinking_enabled
+                previous_effort = llm.reasoning_effort
+                try:
+                    llm.thinking_enabled = False
+                    llm.reasoning_effort = None
+                    llm._deadline_override = remaining
+                    if self._config.get("show_sent_messages", False):
+                        self._log("sent_messages", json.dumps(final_messages, ensure_ascii=False, indent=2),
+                                  console_only=True)
+                    return llm.chat(final_messages)
+                finally:
+                    llm.thinking_enabled = previous_thinking
+                    llm.reasoning_effort = previous_effort
         finally:
             if previous_override is None:
                 try:
@@ -2727,6 +2758,9 @@ class AgentSession:
         self._current_state_type = stype
         self._memory.observe(state)
         state_text = format_state(state, self._memory)
+        if "formatting error:" in state_text:
+            self._handle_model_failure(state, "Visible observation formatting failed; no model request sent.")
+            return
 
         if stype in TERMINAL_SCREEN_TYPES:
             self._log("info", state_text)
@@ -2761,7 +2795,6 @@ class AgentSession:
             selection_id=str(state.get("selection_id") or ""),
         )
 
-        user_template = self._config["user_template"]
         show_thinking = str(self._config.get("show_thinking", "brief"))
         try:
             attempts = max(1, int(self._config.get("decision_attempts", 3)))
@@ -2804,7 +2837,10 @@ class AgentSession:
                 )
                 break
             messages = self._ctx.build_messages(
-                system_prompt, self._memory.to_text(), state_text
+                system_prompt + "\n\n" + enemy_behavior_context(
+                    state, self._config.get("enemy_behavior_knowledge", True)
+                ), self._memory.to_text(), state_text,
+                user_template=self._config.get("user_template", DEFAULT_USER_TEMPLATE),
             )
             if feedback:
                 messages.append({
@@ -2848,28 +2884,8 @@ class AgentSession:
                     f"LLM 只返回了思考过程、未给出决策文本"
                     f"（finish_reason={e.finish_reason or '?'}）: {e}",
                 )
-                feedback = (
-                    "Your previous reply contained ONLY your reasoning /"
-                    " thinking and NO answer text, so no decision was"
-                    " received.\n"
-                    "What was missing: the final JSON object with the"
-                    ' "thought" and "action" fields.\n'
-                    + (
-                        "Cause: your thinking was cut off by the output length"
-                        " limit (finish_reason=length) before you wrote any"
-                        " JSON. Fix: keep your reasoning to ONE short sentence"
-                        " and output the JSON immediately after it.\n"
-                        if e.finish_reason == "length"
-                        else "Fix: skip the long reasoning and output EXACTLY"
-                        " ONE valid JSON object and nothing else.\n"
-                    )
-                    + 'Reply now with e.g. {"thought":"one short tactical'
-                    ' sentence","action":"end_turn"}.\n'
-                    "The current state above has NOT changed and is still"
-                    " accurate. The legal response shapes are listed at the"
-                    " end of the state under 'Allowed response shapes for"
-                    " THIS screen'."
-                )
+                feedback = empty_answer_feedback(
+                    chunk=False, truncated=e.finish_reason == "length")
                 prev_action_json = ""
                 raw_reply = ""
                 continue
@@ -2936,20 +2952,9 @@ class AgentSession:
                     f"Invalid action (attempt {attempt}): {err} | reply: {raw_reply[:200]}",
                 )
                 continue
-            # HARD CONTRACT: a bare decision without "thought" is rejected.
+            # Presentation is useful but must not spend another decision call.
             if not self._has_thought(raw_reply, parsed, llm):
-                feedback = (
-                    "REJECTED: your reply contained ONLY the decision. Include a"
-                    ' non-empty "thought" field with one concise sentence of'
-                    " tactical reasoning INSIDE the same JSON object. Reply"
-                    " again with exactly one JSON object and nothing else."
-                )
-                prev_action_json = json.dumps(parsed, ensure_ascii=False)
-                self._log(
-                    "error",
-                    f"Missing thought (attempt {attempt}); 驳回并要求补充推理",
-                )
-                continue
+                self._log("warning", "Legal action received without a thought summary.")
             break
 
         if act is None:
@@ -3106,10 +3111,8 @@ class AgentSession:
         except Exception:
             return None
         if "formatting error:" in text:
-            # format_state caught a formatter exception and fell back to a
-            # text that embeds the RAW payload (request_id / possibly
-            # non-human-visible fields). Such a state must NEVER take part
-            # in a confirmation comparison -> UNKNOWN_CONFIRMATION.
+            # An error marker contains no usable observation and cannot
+            # establish whether an action changed the visible state.
             return None
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 

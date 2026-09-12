@@ -322,6 +322,7 @@ internal static class CardSerialization
                             texts.Add(text);
                             previews.Add(new Dictionary<string, object>
                             {
+                                ["enemy_index"] = combatState.Enemies.ToList().IndexOf(target),
                                 ["enemy_id"] = target.IsMonster
                                     ? target.Monster!.Id.Entry : "UNKNOWN",
                                 ["enemy_name"] = target.IsMonster

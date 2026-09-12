@@ -79,6 +79,7 @@ def _enemy_subset(state: dict[str, Any]) -> list[dict[str, Any]]:
             "block": e.get("block"),
             "is_alive": e.get("is_alive"),
             "intent": e.get("intent"),
+            "intents": e.get("intents"),
             "intent_damage": e.get("intent_damage"),
             "intent_hits": e.get("intent_hits"),
             "powers": e.get("powers"),
@@ -238,7 +239,7 @@ def render_delta(
     if len(lines) <= 3:
         lines.append("No decision-relevant visible delta was detected.")
     lines.append(
-        "Everything not listed above should be treated as unchanged from the "
-        "previous model observation. If any doubt remains, request/use a FULL state."
+        "This is a change summary only. Use the full current state below for "
+        "effects, legal actions and the new reference mapping."
     )
     return "\n".join(lines)

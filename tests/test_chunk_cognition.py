@@ -65,19 +65,14 @@ class TestCompactPrompt(unittest.TestCase):
                       DEFAULT_SYSTEM_TEMPLATE)
 
     def test_compact_prompt_contains_chunk_cognition_granularity_rule(self):
-        self.assertIn(
-            "do not stop after the first action merely because the game"
-            " executes actions sequentially",
-            DEFAULT_SYSTEM_TEMPLATE)
-        # §13: no length reward -- one-action chunks stay legitimate.
-        self.assertIn("A longer chunk is not inherently better",
-                      DEFAULT_SYSTEM_TEMPLATE)
+        self.assertIn("Do not stop merely because", ACTION_CHUNK_CONTRACT)
+        self.assertIn("length has no strategic value", ACTION_CHUNK_CONTRACT)
+        self.assertNotIn("checkpoint_after", DEFAULT_SYSTEM_TEMPLATE)
 
     def test_hidden_run_info_forbidden(self):
-        self.assertIn("never use or infer the actual value of hidden"
-                      " run-specific information",
-                      DEFAULT_SYSTEM_TEMPLATE.lower()
-                      if False else DEFAULT_SYSTEM_TEMPLATE)
+        self.assertIn("Hidden run-specific data is unavailable", DEFAULT_SYSTEM_TEMPLATE)
+        self.assertIn("RNG state or seed", DEFAULT_SYSTEM_TEMPLATE)
+        self.assertIn("infer logically certain consequences", DEFAULT_SYSTEM_TEMPLATE)
 
     def test_prompt_composition_roles_are_separate(self):
         # RULEBOOK = mechanics only; OBJECTIVE = neutral target;

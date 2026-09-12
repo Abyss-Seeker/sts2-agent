@@ -949,6 +949,8 @@ public class RlCombatHandler : IRoomHandler, IHandler
                     AbstractIntent firstIntent = nextMove.Intents[0];
                     data["intent"] = firstIntent.IntentType.ToString();
                     data["intent_move_id"] = nextMove.Id;
+                    data["intents"] = nextMove.Intents.Select(intent =>
+                        intent.IntentType.ToString()).ToList();
 
                     if (firstIntent is AttackIntent attackIntent)
                     {

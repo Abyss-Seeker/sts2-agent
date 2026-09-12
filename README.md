@@ -97,6 +97,13 @@ server.py + static/     # 本地 Web UI（配置 API/模板、观测决策日志
 失败与内部重试），且不增加非法动作率、无隐藏信息。
 
 ### DeepSeek 能力（可选）
+`reasoning_max_chars` 默认 6000，0 关闭护栏。对支持原生 thinking 的端点，
+护栏会启用流式；收到思考增量时检查字符预算及本次时间预算的 60%。
+达到预算会关闭原流，用已有分析和完整状态关闭 thinking 请求最终 JSON，
+两次请求共用原截止时间。它不是服务端 token 上限，不保证质量完全不变；
+无数据到达时仍由 HTTP 截止时间保护。中转需支持原生字段并选 deepseek profile。
+`max_tokens` 是思考与答案共用额度，单纯调小可能反而导致无答案。
+
 `thinking_enabled` / `reasoning_effort`（low|high|max）通过
 `provider_profile` 控制是否下发：`auto`（默认）**仅当主机名是官方
 api.deepseek.com 时**启用，绝不凭模型名猜测（中转上跑
@@ -107,12 +114,13 @@ api.deepseek.com 时**启用，绝不凭模型名猜测（中转上跑
 ### Delta 观测策略（正确性优先）
 `delta_observations` 默认 **关闭**。即使打开，凡涉及新牌/引用失效的检查点
 （HAND_CHANGED / NEXT_ACTION_ILLEGAL / CARD_GONE / TARGET_GONE /
-POTION_INVALID）以及任何新增手牌信息都**强制发送完整状态**——紧凑 delta
-无法承载新卡的完整人眼可见信息（费用/可打性/显示文本/附魔/hover）。
+POTION_INVALID）以及任何新增手牌信息都直接发送完整状态。其他检查点也会在
+delta 后附完整当前状态，避免历史关闭或裁剪后丢失卡面、状态与合法动作信息。
 
 ### 信息对等（human parity，保持不变）
-模型只能看到真人玩家在当前界面能看到的信息：无抽牌堆顺序、无 RNG、
-无 '?' 房间真实类型、无未来敌人意图细节、无隐藏事件结果。
+模型可见当前公开状态，以及真人反复游玩可以学到的静态知识（包括敌人行为
+模式、条件与概率）。不提供 seed、RNG、抽牌堆顺序、未来随机结果、'?' 房间
+隐藏类型或隐藏事件结果。静态条件推演不等于读取本局隐藏状态。
 
 ## 无游戏基础 LLM 的适配
 
@@ -136,7 +144,7 @@ LLM API 是无状态的，长局远超窗口，因此每步决策的消息构成
 2. **运行记忆**（`RunMemory`：楼层/HP/金币/遗物/近期事件，每步重新生成，
    永不裁剪）；
 3. **滚动历史**：最近 N 个（局面→决策→结果）轮次，按 `max_context_chars`
-   预算从最旧开始丢弃，单局面文本超限自动截断；
+   预算从最旧开始丢弃；必要的卡面与选项信息不会为了字符预算被整行删除；
 4. 当前局面作为最终 user 消息。
 
 ## 日志
@@ -153,3 +161,69 @@ python e2e_test.py              # 假桥接 + MockLLM 的完整单动作决策�
 python tests\test_core_runtime.py   # ActionChunk 核心运行时（解析/执行器/检查点）
 python tests\test_beta_e2e.py       # action_chunk 验收：一次调用多动作/抽牌检查点/拒绝/严格失败
 ```
+## Enemy Behavior Knowledge
+
+游戏版本、数据同步状态和升级检查清单见 [版本维护记录](docs/GAME_VERSION_MAINTENANCE.md)。游戏升级、重新提取数据或部署桥接后，应同步更新该记录。
+
+`enemy_behavior_knowledge` defaults to `true`. The control panel checkbox
+"敌人行为知识（默认开）" saves the same setting. Set it to `false` to stop
+adding this reference to model requests; visible intents and powers remain.
+Existing configurations inherit the enabled default without editing secrets.
+
+Both single-action and ActionChunk requests, including delta checkpoints and
+in-combat selections, receive reference information for living enemy types.
+It contains static move sequences, conditional/random branches, cooldowns,
+buff/debuff amounts and relevant power implementations. The reference is
+included separately from disposable decision history so disabling history
+does not remove enemy knowledge. Disabling the feature stops new injection;
+it does not erase facts the model previously mentioned in decision history.
+
+The bundled `docs/enemy_behaviors.json` is generated from 121 local decompiled
+monster classes using the SDK's Roslyn C# parser. It preserves gameplay method
+bodies rather than relying on the older, inaccurate MONSTERS_REFERENCE.md.
+It includes source SHA-256 hashes for reproducibility. The model receives
+static definitions, never live AI fields or future random rolls. Conditional
+probabilities must be normalized over eligible moves; unknown history stays
+uncertain. Source-build definitions may differ from the installed game, whose
+visible values always take priority. Unrecognized enemies are explicitly
+marked as lacking a reference.
+
+Regenerate after updating the decompiled source (.NET 9 SDK required):
+
+```powershell
+dotnet run --project tools/enemy_reference -- ../decompiled docs/enemy_behaviors.json
+```
+
+Ceremonial Beast has an explicit explanation of the Plow HP threshold,
+Strength removal and stun, phase-two cycle, and Ringing's card-play restriction.
+Flyconid's explanation distinguishes cooldowns from weights (its opening is
+50% Frail Spores / 50% Smash). Other effects retain their static definitions
+and conditions rather than inventing a predicted move for the live instance.
+
+## Prompt Refinement (Schema 4)
+
+Default prompts distinguish learned rules from hidden run-specific facts,
+evaluate resources across the turn and run, and mark historical proposals as
+unconfirmed until execution is observed. Chunk instructions use one consistent
+JSON contract. A missing reasoning summary does not invalidate a legal action;
+empty-response retries do not suggest ending the turn or constrain internal
+reasoning to one sentence.
+
+Custom `user_template` now applies in both request paths. `{{STATE}}` is rendered
+once (or appended if omitted); `{{RUN_MEMORY}}` is supported. Recognized old
+default system templates migrate automatically; customized templates survive.
+Formatting failures stop model requests instead of exposing raw bridge JSON.
+
+Observations include potion usage/effects, merchant entrance context, shop card
+details, all visible intent types, and authoritative target-preview indices.
+Full-belt potion rewards remain visible but unavailable until a slot is freed.
+These bridge-side additions require the rebuilt `STS2BridgeMod.dll` and a game
+restart; Python prompt changes require restarting the agent server. Build with
+`dotnet build bridge_update/STS2BridgeMod.csproj`. The output is under
+`bridge_update/.godot/mono/temp/bin/Debug/`.
+
+Enemy reference generation removes cosmetic calls and unused private helpers,
+preserves gameplay conditions and amounts, and shares duplicate power definitions
+within a request. No live move identifier is passed to the model.
+Automated checks validate formatting, contracts and information boundaries;
+they do not establish an improvement in win rate without gameplay comparisons.

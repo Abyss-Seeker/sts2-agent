@@ -5,7 +5,7 @@ from action_plan import parse_action_chunk, ActionKind
 from plan_executor import ActionChunkExecutor
 from presentation import overlay_snapshot
 
-@pytest.mark.parametrize("screen", ["combat_action", "event", "shop", "map", "card_reward", "card_select", "rest_site"])
+@pytest.mark.parametrize("screen", ["combat_action", "event", "shop", "map", "card_reward", "card_select", "rest_site", "reward_screen", "card_bundle", "crystal_sphere", "treasure", "boss_relic"])
 def test_inventory_actions_on_each_screen(screen):
     state = {"type": screen, "player": {"potions": [{"slot": 0, "id": "FRUIT_JUICE", "can_use": True, "can_discard": True}]}}
     assert validate_action(state, {"action": "potion", "slot": 0})[0]

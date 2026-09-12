@@ -69,6 +69,7 @@ class LLMClient:
         reasoning_effort: str | None = None,
         stream_mode: str = "off",
         provider_profile: str = "auto",
+        reasoning_max_chars: int = 0,
     ):
         self.base_url = (base_url or "").rstrip("/")
         if self.base_url.endswith("/chat/completions"):
@@ -88,6 +89,7 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.max_retries = max_retries
+        self.reasoning_max_chars = max(0, int(reasoning_max_chars))
         self.last_reasoning: str = ""  # provider reasoning_content, if any
         self.last_finish_reason: str = ""  # provider finish_reason, if any
         # Token accounting for the UI (cumulative over this client's life).
@@ -254,6 +256,13 @@ class LLMClient:
             total_budget = min(total_budget, max(0.001, float(deadline_seconds)))
         deadline_at = time.monotonic() + total_budget
         use_stream = self._should_stream()
+        bounded_reasoning = (self.caps.supports_thinking_toggle
+                             and self.thinking_enabled is not False
+                             and self.reasoning_max_chars > 0)
+        if bounded_reasoning:
+            use_stream = True
+        self._reasoning_deadline = (time.monotonic() + total_budget * 0.6
+                                    if bounded_reasoning else None)
         payload = build_chat_payload(
             model=self.model,
             messages=messages,
@@ -357,6 +366,14 @@ class LLMClient:
                 events = parse_sse_data_lines([raw_line])
                 for event in events:
                     r_delta, c_delta = acc.feed_event(event)
+                    if (r_delta and not acc.content and self._reasoning_deadline is not None
+                            and (len(acc.reasoning) >= self.reasoning_max_chars
+                                 or time.monotonic() >= self._reasoning_deadline)):
+                        raise EmptyContentError(
+                            "Reasoning budget reached; finalize the existing draft.",
+                            finish_reason="reasoning_budget",
+                            reasoning=acc.reasoning[:self.reasoning_max_chars],
+                        )
                     if r_delta:
                         # Write the first-token timestamp ONCE, based on the
                         # real call-start monotonic timestamp.

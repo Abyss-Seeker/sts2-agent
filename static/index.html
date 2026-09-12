@@ -93,6 +93,7 @@
       <label class="chk"><input id="fast_mode" type="checkbox"> FastMode（加速原生动画，独立开关）</label>
       <label class="chk"><input id="disable_fallback" type="checkbox"> 禁用游戏端随机替打（推荐）</label>
       <label class="chk"><input id="save_log" type="checkbox"> 保存决策日志到 logs/</label>
+      <label class="chk"><input id="show_sent_messages" type="checkbox"> 显示完整发送消息（仅控制台）</label>
     </section>
 
     <section>
@@ -112,6 +113,9 @@
           </select>
         </label>
       </div>
+      <label>Thinking 字符预算（0 = 关闭）
+        <input id="reasoning_max_chars" type="number" min="0" step="500">
+      </label>
       <label>Reasoning policy
         <select id="reasoning_policy">
           <option value="fixed">fixed（全局固定档位）</option>
@@ -194,6 +198,7 @@
       <div class="row">
         <label>单计划动作上限 <input id="action_chunk_max_actions" type="number" min="1" max="32"></label>
         <label class="chk"><input id="delta_observations" type="checkbox"> 检查点用增量观测（默认关）</label>
+        <label class="chk"><input id="enemy_behavior_knowledge" type="checkbox" checked> 敌人行为知识（默认开）</label>
       </div>
       <p class="hint">action_chunk：一次模型推理可驱动多个逐个被桥接确认的战斗动作；出现新信息/动作失效时立即中断并向模型重新询问。交互游玩默认 resilient；strict 仅适合不允许任何兜底的评测。</p>
     </section>

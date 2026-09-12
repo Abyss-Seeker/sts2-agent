@@ -9,7 +9,7 @@
   <ItemGroup>
     <Compile Include="*.cs" />
     <Compile Include="../../bridge_mod/*.cs"
-      Exclude="../../bridge_mod/BridgeServer.cs;../../bridge_mod/CardSerialization.cs;../../bridge_mod/RlCombatHandler.cs;../../bridge_mod/RlNonCombatRoomHandlers.cs;../../bridge_mod/RunSummary.cs;../../bridge_mod/PotionActions.cs" />
+      Exclude="../../bridge_mod/BridgeServer.cs;../../bridge_mod/CardSerialization.cs;../../bridge_mod/RlCombatHandler.cs;../../bridge_mod/RlNonCombatRoomHandlers.cs;../../bridge_mod/RunSummary.cs;../../bridge_mod/PotionActions.cs;../../bridge_mod/RlRewardsScreenHandler.cs;../../bridge_mod/RlMapHandler.cs" />
     <Reference Include="sts2">
       <HintPath>$(Sts2DataDir)/sts2.dll</HintPath>
       <Private>false</Private>

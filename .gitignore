@@ -23,3 +23,5 @@ bridge_update/.godot/
 bridge_update/bin/
 bridge_update/obj/
 bridge_update/current_*.txt
+tools/enemy_reference/bin/
+tools/enemy_reference/obj/

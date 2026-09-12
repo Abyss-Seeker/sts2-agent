@@ -66,6 +66,14 @@ INTENT_GLOSSARY: dict[str, str] = {
     "DEATH_BLOW": "will execute (likely lethal if it lands)",
     "CARD_DEBUFF": "will put status/curse cards into your deck or hand",
     "UNKNOWN": "intent unknown",
+    "SINGLEATTACK": "will attack (exact damage shown)",
+    "MULTIATTACK": "will attack multiple times (exact damage x hits shown)",
+    "DEBUFFSTRONG": "will apply a strong debuff",
+    "STATUS": "will add status cards",
+    "STATUSCARD": "will add status cards",
+    "CARDDEBUFF": "will debuff cards",
+    "DEATHBLOW": "will attempt a lethal attack; inspect current powers and effects",
+    "HIDDEN": "intent is not currently visible",
 }
 
 # Keyword tooltips (core set; extend as the game build grows).
@@ -79,7 +87,7 @@ KEYWORD_GLOSSARY: dict[str, str] = {
     "Summon": "Summon: affects your summoned ally (e.g. Necrobinder's Osty).",
     "Stars": "Stars: Regent resource; some cards cost Stars in addition to (or instead of) energy.",
     "Forge": "Forge: increases a permanent counter on the card.",
-    "Doom": "Doom: a stacked debuff; consuming it deals damage per stack.",
+    "Doom": "Doom: at the end of the afflicted creature's side's turn, it dies if its HP is at or below its Doom stacks (subject to death-prevention effects).",
     "Scry": "Scry: look at and optionally discard the top cards of your draw pile.",
     "Discard": "Discard: moves the card to your discard pile.",
     "Evoke": "Evoke: releases the top orb of your orb slots (Defect).",
